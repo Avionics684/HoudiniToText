@@ -22,7 +22,7 @@ except ImportError:  # Allows syntax checks outside Houdini.
     hou = None  # type: ignore
 
 
-SCHEMA_VERSION = "1.6.2"
+SCHEMA_VERSION = "1.6.3"
 EXPORTER_NAME = "houdini_scene_to_text"
 DEFAULT_MAX_TEXT_CHARS = 200_000
 DEFAULT_GEOMETRY_SAMPLE_COUNT = 0
@@ -32,6 +32,7 @@ DEFAULT_COMPACT_PARAMETER_LIMIT = 24
 DEFAULT_EVALUATE_PARAMETERS = True
 DEFAULT_INCLUDE_BYPASSED_NODES = False
 DEFAULT_INCLUDE_SCENE_PATHS = False
+PARAMETER_SILENT_NODE_TYPES = {"null", "merge"}
 WRANGLE_RUN_OVER_BY_INDEX = {
     0: "Detail (only once)",
     1: "Primitives",
@@ -157,13 +158,56 @@ def _connection_touches_paths(connection: Dict[str, Any], paths: set) -> bool:
 
 
 def _connection_within_paths(connection: Dict[str, Any], paths: set) -> bool:
-    source = connection.get("source", {})
-    target = connection.get("target", {})
-    if not isinstance(source, dict) or not isinstance(target, dict):
-        return False
-    source_path = source.get("item") or source.get("node")
-    target_path = target.get("item") or target.get("node")
+    source_path = _connection_endpoint_path(connection, "source")
+    target_path = _connection_endpoint_path(connection, "target")
     return source_path in paths and target_path in paths
+
+
+def _connection_endpoint_path(connection: Dict[str, Any], endpoint_name: str) -> Optional[str]:
+    endpoint = connection.get(endpoint_name, {})
+    if not isinstance(endpoint, dict):
+        return None
+    return endpoint.get("item") or endpoint.get("node")
+
+
+def _node_type_token(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    if "::" in text:
+        text = text.split("::", 1)[0]
+    return text
+
+
+def _node_type_record_suppresses_parameters(node_type: Dict[str, Any]) -> bool:
+    if not isinstance(node_type, dict):
+        return False
+    category = _node_type_token(node_type.get("category"))
+    name_with_category = str(node_type.get("name_with_category") or "").strip().lower()
+    if category != "sop" and not name_with_category.startswith("sop/"):
+        return False
+    candidates = {
+        _node_type_token(node_type.get("name")),
+        _node_type_token(node_type.get("name_with_category")),
+        _node_type_token(node_type.get("description")),
+    }
+    return bool(candidates & PARAMETER_SILENT_NODE_TYPES)
+
+
+def _connection_indices_equal(left: Any, right: Any) -> bool:
+    if left == right:
+        return True
+    try:
+        return int(left) == int(right)
+    except Exception:
+        return False
+
+
+def _connection_index_is_zero(value: Any) -> bool:
+    try:
+        return int(value) == 0
+    except Exception:
+        return False
 
 
 def _as_plain(value: Any, max_text_chars: int = DEFAULT_MAX_TEXT_CHARS) -> Any:
@@ -321,12 +365,12 @@ class HoudiniSceneExporter:
             nodes_for_export = [node for node in nodes if _path_of(node) not in skipped_bypassed_paths]
         else:
             nodes_for_export = nodes
-        connections = self._collect_connections(nodes_for_export, network_items)
+        connections = self._collect_connections(nodes, network_items)
+        if skipped_bypassed_paths:
+            connections = self._connections_with_skipped_bypassed_nodes(connections, skipped_bypassed_paths)
         if self.node_paths:
             allowed_paths = {path for path in (_path_of(node) for node in nodes_for_export) if path}
             connections = [connection for connection in connections if _connection_within_paths(connection, allowed_paths)]
-        if skipped_bypassed_paths:
-            connections = [connection for connection in connections if not _connection_touches_paths(connection, skipped_bypassed_paths)]
 
         node_records: List[Dict[str, Any]] = []
         code_blocks: List[Dict[str, Any]] = []
@@ -519,6 +563,162 @@ class HoudiniSceneExporter:
         records.sort(key=lambda row: str(row.get("key", "")))
         return records
 
+    def _connections_with_skipped_bypassed_nodes(self, connections: Sequence[Dict[str, Any]], skipped_paths: set) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        keys = set()
+        for connection in connections:
+            if _connection_touches_paths(connection, skipped_paths):
+                continue
+            key = connection.get("key")
+            if key:
+                keys.add(key)
+            records.append(connection)
+
+        for connection in self._synthetic_bypassed_connections(connections, skipped_paths):
+            key = connection.get("key")
+            if key and key in keys:
+                continue
+            if key:
+                keys.add(key)
+            records.append(connection)
+
+        records.sort(key=lambda row: str(row.get("key", "")))
+        return records
+
+    def _synthetic_bypassed_connections(self, connections: Sequence[Dict[str, Any]], skipped_paths: set) -> List[Dict[str, Any]]:
+        outgoing_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        entry_connections: List[Dict[str, Any]] = []
+        for connection in connections:
+            source_path = _connection_endpoint_path(connection, "source")
+            target_path = _connection_endpoint_path(connection, "target")
+            if source_path in skipped_paths:
+                outgoing_by_source.setdefault(source_path, []).append(connection)
+            if target_path in skipped_paths and source_path not in skipped_paths:
+                entry_connections.append(connection)
+
+        for source_connections in outgoing_by_source.values():
+            source_connections.sort(key=lambda row: str(row.get("key", "")))
+        entry_connections.sort(key=lambda row: str(row.get("key", "")))
+
+        records: List[Dict[str, Any]] = []
+        keys = set()
+        for entry_connection in entry_connections:
+            first_bypassed_path = _connection_endpoint_path(entry_connection, "target")
+            if not first_bypassed_path:
+                continue
+            self._walk_bypassed_connection_routes(
+                source_connection=entry_connection,
+                current_connection=entry_connection,
+                current_bypassed_path=first_bypassed_path,
+                bypassed_paths=[first_bypassed_path],
+                outgoing_by_source=outgoing_by_source,
+                skipped_paths=skipped_paths,
+                records=records,
+                keys=keys,
+            )
+        return records
+
+    def _walk_bypassed_connection_routes(
+        self,
+        source_connection: Dict[str, Any],
+        current_connection: Dict[str, Any],
+        current_bypassed_path: str,
+        bypassed_paths: List[str],
+        outgoing_by_source: Dict[str, List[Dict[str, Any]]],
+        skipped_paths: set,
+        records: List[Dict[str, Any]],
+        keys: set,
+    ) -> None:
+        if len(bypassed_paths) > len(skipped_paths):
+            return
+
+        outgoing_connections = self._bypassed_outgoing_connections_for_input(
+            current_connection,
+            outgoing_by_source.get(current_bypassed_path, []),
+        )
+        for outgoing_connection in outgoing_connections:
+            target_path = _connection_endpoint_path(outgoing_connection, "target")
+            if not target_path:
+                continue
+            if target_path in skipped_paths:
+                if target_path in bypassed_paths:
+                    continue
+                self._walk_bypassed_connection_routes(
+                    source_connection=source_connection,
+                    current_connection=outgoing_connection,
+                    current_bypassed_path=target_path,
+                    bypassed_paths=bypassed_paths + [target_path],
+                    outgoing_by_source=outgoing_by_source,
+                    skipped_paths=skipped_paths,
+                    records=records,
+                    keys=keys,
+                )
+                continue
+
+            record = self._synthetic_bypassed_connection_record(source_connection, outgoing_connection, bypassed_paths)
+            key = record.get("key")
+            if key and key in keys:
+                continue
+            if key:
+                keys.add(key)
+            records.append(record)
+
+    def _bypassed_outgoing_connections_for_input(
+        self,
+        incoming_connection: Dict[str, Any],
+        outgoing_connections: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not outgoing_connections:
+            return []
+
+        target = incoming_connection.get("target", {})
+        input_index = target.get("input_index") if isinstance(target, dict) else None
+        if input_index is None:
+            return list(outgoing_connections)
+
+        exact_matches = []
+        primary_matches = []
+        for connection in outgoing_connections:
+            source = connection.get("source", {})
+            output_index = source.get("output_index") if isinstance(source, dict) else None
+            if _connection_indices_equal(input_index, output_index):
+                exact_matches.append(connection)
+            elif _connection_index_is_zero(input_index) and (output_index is None or _connection_index_is_zero(output_index)):
+                primary_matches.append(connection)
+        if exact_matches:
+            return exact_matches
+        if primary_matches:
+            return primary_matches
+        return []
+
+    def _synthetic_bypassed_connection_record(
+        self,
+        source_connection: Dict[str, Any],
+        target_connection: Dict[str, Any],
+        bypassed_paths: Sequence[str],
+    ) -> Dict[str, Any]:
+        source = dict(source_connection.get("source", {}) or {})
+        target = dict(target_connection.get("target", {}) or {})
+        source_path = source.get("item") or source.get("node")
+        target_path = target.get("item") or target.get("node")
+        key = "%s:%s->%s:%s" % (
+            source_path,
+            source.get("output_index"),
+            target_path,
+            target.get("input_index"),
+        )
+        return {
+            "key": key,
+            "source": source,
+            "target": target,
+            "subnet_indirect_input": None,
+            "selected": None,
+            "class": "SyntheticBypassedConnection",
+            "synthetic": True,
+            "reason": "bypassed_nodes_skipped",
+            "bypassed_nodes": list(bypassed_paths),
+        }
+
     def _scene_record(self) -> Dict[str, Any]:
         frame_range = self._safe("hou.playbar.frameRange", lambda: hou.playbar.frameRange(), ())
         playback_range = self._safe("hou.playbar.playbackRange", lambda: hou.playbar.playbackRange(), ())
@@ -551,14 +751,19 @@ class HoudiniSceneExporter:
 
     def _node_record(self, node: Any) -> Dict[str, Any]:
         path = _path_of(node)
-        parm_records, code_blocks = self._node_parameters(node)
+        node_type = self._node_type_record(node)
+        if _node_type_record_suppresses_parameters(node_type):
+            parm_records: List[Dict[str, Any]] = []
+            code_blocks: List[Dict[str, Any]] = []
+        else:
+            parm_records, code_blocks = self._node_parameters(node)
         definition_key = self._capture_hda_definition(node)
         record = {
             "path": path,
             "name": self._safe_method(node, "name", None),
             "parent_path": _path_of(self._safe_method(node, "parent", None)),
             "class": node.__class__.__name__,
-            "type": self._node_type_record(node),
+            "type": node_type,
             "hda_definition_key": definition_key,
             "is_network": self._safe_method(node, "isNetwork", None),
             "children": [_path_of(child) for child in self._safe_method(node, "children", ()) or ()],
@@ -1327,8 +1532,6 @@ class HoudiniSceneExporter:
 
 
 def render_compact_markdown(data: Dict[str, Any]) -> str:
-    scene = data.get("scene", {})
-    counts = data.get("counts", {})
     nodes = sorted(data.get("nodes", []), key=lambda row: str(row.get("path", "")))
     connections = data.get("connections", [])
     code_blocks = data.get("code_blocks", [])
@@ -1336,10 +1539,7 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append("# Houdini Scene Summary")
     lines.append("")
-    lines.append("- Houdini: `%s`" % scene.get("houdini_version"))
-    lines.append("- Exporter: `%s %s`  Markdown: `compact`" % (EXPORTER_NAME, data.get("schema_version", SCHEMA_VERSION)))
-    lines.append("- Frame: `%s`  FPS: `%s`" % (scene.get("current_frame"), scene.get("fps")))
-    lines.append("- Counts: nodes=`%s`, connections=`%s`, code_blocks=`%s`" % (counts.get("nodes"), counts.get("connections"), counts.get("code_blocks")))
+    lines.append("- Connection notation: `A to B` means A is connected to B.")
     lines.append("")
 
     lines.append("## Connections")
@@ -1351,8 +1551,13 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
             src_port = src.get("output_name") or src.get("output_index")
             dst_port = dst.get("input_name") or dst.get("input_index")
             lines.append(
-                "- `%s`[%s] -> `%s`[%s]"
-                % (src.get("item") or src.get("node"), src_port, dst.get("item") or dst.get("node"), dst_port)
+                "- `%s`[%s] to `%s`[%s]"
+                % (
+                    src.get("item") or src.get("node"),
+                    src_port,
+                    dst.get("item") or dst.get("node"),
+                    dst_port,
+                )
             )
     else:
         lines.append("(none)")
@@ -1362,6 +1567,8 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
     lines.append("")
     inline_code_keys = set()
     for node in nodes:
+        if _node_type_record_suppresses_parameters(node.get("type", {})):
+            continue
         code_refs = [block for block in node.get("code_blocks", []) if block.get("node_path") == node.get("path")]
         comment = node.get("comment")
         node_type = node.get("type", {}).get("name_with_category") or node.get("type", {}).get("name")
@@ -1602,24 +1809,9 @@ def render_markdown(data: Dict[str, Any]) -> str:
         return render_compact_markdown(data)
 
     lines: List[str] = []
-    scene = data.get("scene", {})
-    counts = data.get("counts", {})
-
     lines.append("# Houdini Scene Export")
     lines.append("")
-    lines.append("Generated: `%s`" % data.get("exporter", {}).get("created_at"))
-    lines.append("")
-    lines.append("## Scene")
-    lines.append("")
-    lines.append("- Houdini: `%s`" % scene.get("houdini_version"))
-    lines.append("- Frame: `%s`  FPS: `%s`" % (scene.get("current_frame"), scene.get("fps")))
-    lines.append("- Frame range: `%s`" % scene.get("frame_range"))
-    lines.append("- Roots: `%s`" % ", ".join(str(root) for root in data.get("roots", [])))
-    lines.append("")
-    lines.append("## Counts")
-    lines.append("")
-    for key in ("nodes", "connections", "network_items", "code_blocks", "hda_definitions", "errors"):
-        lines.append("- %s: `%s`" % (key, counts.get(key)))
+    lines.append("- Connection notation: `A to B` means A is connected to B.")
     lines.append("")
 
     lines.extend(_render_node_tree(data.get("nodes", [])))
@@ -1655,13 +1847,18 @@ def _render_connections(connections: Sequence[Dict[str, Any]]) -> List[str]:
         src_port = src.get("output_name") or src.get("output_index")
         dst_port = dst.get("input_name") or dst.get("input_index")
         lines.append(
-            "- `%s`[%s] -> `%s`[%s]"
-            % (src.get("item") or src.get("node"), src_port, dst.get("item") or dst.get("node"), dst_port)
+            "- `%s`[%s] to `%s`[%s]"
+            % (
+                src.get("item") or src.get("node"),
+                src_port,
+                dst.get("item") or dst.get("node"),
+                dst_port,
+            )
         )
         src_type = src.get("output_data_type")
         dst_type = dst.get("input_data_type")
         if src_type or dst_type:
-            lines.append("  data_type: `%s` -> `%s`" % (src_type, dst_type))
+            lines.append("  data_type: `%s` to `%s`" % (src_type, dst_type))
     lines.append("")
     return lines
 
