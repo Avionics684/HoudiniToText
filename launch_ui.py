@@ -5,5 +5,5 @@ from __future__ import annotations
 import runpy
 
 
-tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py")
+tool = runpy.run_path(r"C:\Users\username\Documents\houdinitotext\houdini_scene_to_text.py")
 tool["show_export_ui"]()
