@@ -26,7 +26,7 @@ Houdini 21 の現在の HIP シーンを、LLM に渡しやすい Markdown と�
 ```python
 import runpy
 
-tool = runpy.run_path(r"C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py")
+tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py")
 tool["show_export_ui"]()
 ```
 
@@ -35,13 +35,13 @@ UIが開いたら、通常はそのまま `書き出す` を押します。標�
 短い1行で起動したい場合は、起動専用ファイルを実行します。
 
 ```python
-exec(open(r"C:\Users\user\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
+exec(open(r"C:\Users\ponpa\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
 ```
 
 メインスクリプトを直接実行する方式も使えます。
 
 ```python
-exec(open(r"C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py", encoding="utf-8").read())
+exec(open(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py", encoding="utf-8").read())
 ```
 
 ### Shelf Tool に登録する場合
@@ -49,7 +49,7 @@ exec(open(r"C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py", enc
 Shelf に Python Tool を作り、Script 欄に同じ1行を入れます。
 
 ```python
-exec(open(r"C:\Users\user\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
+exec(open(r"C:\Users\ponpa\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
 ```
 
 ### runpy で読み込む場合
@@ -59,7 +59,7 @@ exec(open(r"C:\Users\user\Documents\houdinitotext\launch_ui.py", encoding="utf-8
 ```python
 import runpy
 
-tool = runpy.run_path(r"C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py")
+tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py")
 tool["show_export_ui"]()
 ```
 
@@ -70,7 +70,7 @@ tool["show_export_ui"]()
 ```python
 import runpy
 
-tool = runpy.run_path(r"C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py")
+tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py")
 paths = tool["export_current_scene"](
     output=r"C:\tmp\houdini_scene_export",
 )
@@ -107,19 +107,19 @@ paths = tool["export_current_scene"](
 Houdini Command Line Tools など、`hython` が通っている環境で、HIP ファイルを指定して実行できます。
 
 ```powershell
-hython C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --out C:\tmp\houdini_scene_export
+hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --out C:\tmp\houdini_scene_export
 ```
 
 選択中ノードだけを書き出す場合。選んだノードそのものだけを書き出し、子ノードには潜りません:
 
 ```powershell
-hython C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --selected --out C:\tmp\selected_export
+hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --selected --out C:\tmp\selected_export
 ```
 
 特定ネットワークだけを書き出す場合:
 
 ```powershell
-hython C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --root /obj/geo1 --out C:\tmp\geo1_export
+hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --root /obj/geo1 --out C:\tmp\geo1_export
 ```
 
 ## 重要オプション
@@ -129,9 +129,24 @@ hython C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to
 - `--include-scene-paths`
   - HIP ファイルパスやロード済み HDA ファイルパスも含めます。既定では出しません。
 - `--markdown-mode compact`
-  - 既定値。HIP ファイルパスや重複しやすい Node Graph の全ツリーは省き、接続、各ノードの見えるインスペクタ設定、コードを短くまとめます。Wrangle は VEX と Run Over を優先し、autobind/export/vex_* 系の細かい内部設定は出しません。ノードの所属階層は `/obj/geo1/...` のようなパスから読めます。`0` や空文字の値も含め、現在フレームで評価できた値を優先して書きます。デフォルト値の代用表示はしません。パラメータがないノードは `Params` 行を出しません。インスペクタ設定は 1 ノード最大 24 項目まで出し、超過分は件数だけ表示します。従来の詳細版が必要なら `--markdown-mode verbose`。
+  - 既定値。HIP ファイルパスや重複しやすい Node Graph の全ツリーは省き、接続、各ノードの見えるインスペクタ設定、コードを短くまとめます。Wrangle は VEX と Run Over を優先し、autobind/export/vex_* 系の細かい内部設定は出しません。ノードの所属階層は `/obj/geo1/...` のようなパスから読めます。`0` や空文字の値も含め、現在フレームで評価できた値を優先して書きます。パラメータがないノードは `Params` 行を出しません。インスペクタ設定は 1 ノード最大 24 項目まで出し、超過分は件数だけ表示します。従来の詳細版が必要なら `--markdown-mode verbose`。
+  - 接続はネットワーク（親ノード）ごとにまとめ、ノードは相対名で書きます。第1入力への直列接続は `grid1 -> subdivide1 -> COPY` のようにチェーン表記へ圧縮し、それ以外のポートは `[output2]` / `[input3: Constraint Geometry]` のようにポート名とラベルで明示します。
+  - ワイヤー中継用のドット（丸い中継点）は透過して、ノード同士の直接接続として書きます（出力ポート番号もドット越しに保持。JSON では `via_dots` に経由したドットを記録）。
+  - どこにも接続されていないノードは `Not wired:` 行に列挙します。
+  - フォルダの開閉状態パラメータ（`folder3` 等）や、ランプの各ポイントのバラバラな内部パラメータは省き、ランプは `ramp (0, 1) (1, 1) @ Catmull-Rom` の1行に要約します。
+  - Inspector Settings のノード順は重要度ベースです。LLM は長文の先頭と末尾への注意力が高いため、ソルバー・Wrangle・フラクチャ等の重要ノードを最初と最後に、box / merge / transform 等の脇役を中央に配置します。
+  - ソルバー等の重要ノードは、全パラメータがデフォルトでも `- Defaults:` 行として先頭側の主要パラメータを最大10個表示します（Houdini の UI は重要な設定ほど上に並ぶため、汎用的にどのノードタイプでも機能します）。
+  - 末尾に LLM 向けの短い日本語の指示文（このダンプを根拠に、不確かな仕様は SideFX の最新公式ドキュメントを調べ、正確な Houdini 知識で答える等）を自動で付けます。全モード共通です。
+  - ユーザーがリネームしたノード（名前からタイプが読めないノード）には `` `COPY` (Copy to Points) `` のようにノードタイプのラベルを併記します。
+  - デフォルト値のままのパラメータは省略し、ユーザーが変更した値だけを出します（JSON には全パラメータが残ります）。
+  - プルダウン（メニュー）パラメータは `2` のような内部インデックスではなく、UI に見えているメニューラベルで書きます。
 - `--markdown-mode verbose`
   - 詳細版です。UI既定のまま現在フレーム1枚だけ `parm.eval()` し、評価値を記録します。式や未展開文字列も併記します。
+- `--markdown-mode attributes`
+  - アトリビュートモード（旧称 ultra。互換のため `--markdown-mode ultra` も同じ動作）。ジオメトリを cook して、各アトリビュートのサンプル値を既定で5個ずつ書き出します（`(first 5 of 12000 elements)` のように全体数も併記）。連続して同じ値は `0.5 (x5)` のようにまとめます。全要素が必要なら `--geometry-sample-count -1` を併用してください。
+  - point / primitive / vertex / edge の各グループも `#### primitive group (3021 of 584176 primitives)` のようにアトリビュートと並べて出力します。detail（global）アトリビュートも値付きで出ます。
+  - 複数ノード選択（`--selected` で複数選択）にも対応しており、選択した各ノードごとにパラメータとアトリビュートのセクションが並びます。cook が走るため、対象は必要なノードに絞るのがおすすめです。
+  - パラメータはデフォルトから変更されたものだけをラベル・式付きで出し、残りは `N parameters at default omitted` の1行にまとめます（全パラメータ値が必要なら JSON か verbose を使ってください）。フォルダ・セパレータ・ラベル・ボタンなどUI専用パラメータは出しません。
 - `--hda-section-mode none`
   - 既定値。HDA セクション本文を含めません。
 - `--hda-section-mode scene`
@@ -142,6 +157,8 @@ hython C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to
   - 隠しパラメータも含めます。既定では出しません。
 - `--include-bypassed-nodes`
   - バイパスされたノードも含めます。既定では出しません。
+- `--include-network-items`
+  - 付箋（スティッキーノート）、ネットワークボックス、ワイヤー中継ドットのレコードも JSON に含めます。既定では見た目用の要素なので出しません。ドットは常に直結扱いへ変換されます。
 - `--recurse-locked`
   - Locked HDA の中も再帰的に見ます。既定では潜りません。
 - `--sync-delayed`
@@ -149,7 +166,7 @@ hython C:\Users\user\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to
 - `--max-text-chars 0`
   - 文字列の省略を無効にします。巨大な HIP では出力も大きくなります。
 - `--changed-only`
-  - デフォルト値から変わっているパラメータだけに絞ります。デフォルト判定を問い合わせるため、完全に安全寄りで読みたい場合はOFF推奨です。
+  - JSON も含めて、デフォルト値から変わっているパラメータだけに絞ります。コンパクト Markdown は既定でもデフォルト値のパラメータを省略するので、主に JSON を小さくしたいときに使います。デフォルト判定を問い合わせるため、完全に安全寄りで読みたい場合はOFF推奨です。
 - `--evaluate-parameters`
   - 既定値。現在フレーム1枚だけパラメータの評価値も記録します。
 - `--no-evaluate-parameters`
