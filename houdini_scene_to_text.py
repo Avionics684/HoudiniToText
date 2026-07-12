@@ -22,7 +22,7 @@ except ImportError:  # Allows syntax checks outside Houdini.
     hou = None  # type: ignore
 
 
-SCHEMA_VERSION = "1.6.3"
+SCHEMA_VERSION = "1.11.1"
 EXPORTER_NAME = "houdini_scene_to_text"
 DEFAULT_MAX_TEXT_CHARS = 200_000
 DEFAULT_GEOMETRY_SAMPLE_COUNT = 0
@@ -311,6 +311,7 @@ class HoudiniSceneExporter:
         include_standard_attributes: bool = False,
         include_bypassed_nodes: bool = DEFAULT_INCLUDE_BYPASSED_NODES,
         include_scene_paths: bool = DEFAULT_INCLUDE_SCENE_PATHS,
+        include_network_items: bool = False,
         temporary_frame: Optional[float] = None,
     ) -> None:
         self.root_paths = list(root_paths or ["/"])
@@ -331,6 +332,7 @@ class HoudiniSceneExporter:
         self.include_standard_attributes = include_standard_attributes
         self.include_bypassed_nodes = include_bypassed_nodes
         self.include_scene_paths = include_scene_paths
+        self.include_network_items = include_network_items
         self.temporary_frame = temporary_frame
         self.errors: List[Dict[str, Any]] = []
         self._connection_keys: set = set()
@@ -365,12 +367,26 @@ class HoudiniSceneExporter:
             nodes_for_export = [node for node in nodes if _path_of(node) not in skipped_bypassed_paths]
         else:
             nodes_for_export = nodes
+        dot_paths = {path for path in (_path_of(item) for item in network_items if self._network_item_is_dot(item)) if path}
         connections = self._collect_connections(nodes, network_items)
+        connections = self._collapse_network_dot_connections(connections, dot_paths)
         if skipped_bypassed_paths:
             connections = self._connections_with_skipped_bypassed_nodes(connections, skipped_bypassed_paths)
         if self.node_paths:
             allowed_paths = {path for path in (_path_of(node) for node in nodes_for_export) if path}
-            connections = [connection for connection in connections if _connection_within_paths(connection, allowed_paths)]
+            resolved_connections = []
+            seen_keys = set()
+            for connection in connections:
+                record = self._connection_resolved_to_nodes(connection, allowed_paths)
+                if not _connection_within_paths(record, allowed_paths):
+                    continue
+                key = record.get("key")
+                if key and key in seen_keys:
+                    continue
+                if key:
+                    seen_keys.add(key)
+                resolved_connections.append(record)
+            connections = resolved_connections
 
         node_records: List[Dict[str, Any]] = []
         code_blocks: List[Dict[str, Any]] = []
@@ -378,6 +394,13 @@ class HoudiniSceneExporter:
             record = self._node_record(node)
             node_records.append(record)
             code_blocks.extend(record.get("code_blocks", []))
+
+        if self.include_network_items:
+            network_item_records = [self._network_item_record(item) for item in network_items]
+        else:
+            # Sticky notes, network boxes and dots are visual layout aids;
+            # dots are already collapsed into direct connections above.
+            network_item_records = []
 
         data = {
             "schema_version": SCHEMA_VERSION,
@@ -406,13 +429,15 @@ class HoudiniSceneExporter:
                 "include_standard_attributes": self.include_standard_attributes,
                 "include_bypassed_nodes": self.include_bypassed_nodes,
                 "include_scene_paths": self.include_scene_paths,
+                "include_network_items": self.include_network_items,
                 "temporary_frame": self.temporary_frame,
             },
             "counts": {
                 "roots": len(roots),
                 "nodes": len(node_records),
                 "connections": len(connections),
-                "network_items": len(network_items),
+                "network_items": len(network_item_records),
+                "network_dots_collapsed": len(dot_paths),
                 "code_blocks": len(code_blocks),
                 "hda_definitions": len(self._hda_definitions),
                 "bypassed_nodes_skipped": len(skipped_bypassed_paths),
@@ -421,7 +446,7 @@ class HoudiniSceneExporter:
             "roots": [_path_of(root) for root in roots],
             "nodes": node_records,
             "connections": connections,
-            "network_items": [self._network_item_record(item) for item in network_items],
+            "network_items": network_item_records,
             "code_blocks": code_blocks,
             "hda_definitions": self._hda_definitions,
             "errors": self.errors,
@@ -560,6 +585,124 @@ class HoudiniSceneExporter:
                     if key and key not in self._connection_keys:
                         self._connection_keys.add(key)
                         records.append(record)
+        records.sort(key=lambda row: str(row.get("key", "")))
+        return records
+
+    def _connection_resolved_to_nodes(self, connection: Dict[str, Any], allowed_paths: set) -> Dict[str, Any]:
+        """When an endpoint item (e.g. a network dot) is outside the export set but hou
+        resolved the real node, swap the item for the node so the connection survives."""
+        source = dict(connection.get("source", {}) or {})
+        target = dict(connection.get("target", {}) or {})
+        changed = False
+        for endpoint in (source, target):
+            item = endpoint.get("item")
+            node = endpoint.get("node")
+            if item and node and item != node and item not in allowed_paths and node in allowed_paths:
+                endpoint["item"] = node
+                if endpoint is source and endpoint.get("node_output_index") is not None:
+                    endpoint["output_index"] = endpoint["node_output_index"]
+                changed = True
+        if not changed:
+            return connection
+        record = dict(connection)
+        record["source"] = source
+        record["target"] = target
+        record["key"] = "%s:%s->%s:%s" % (
+            source.get("item"),
+            source.get("output_index"),
+            target.get("item"),
+            target.get("input_index"),
+        )
+        return record
+
+    def _network_item_is_dot(self, item: Any) -> bool:
+        if item.__class__.__name__ == "NetworkDot":
+            return True
+        item_type = _enum_to_string(self._try_method(item, "networkItemType", None))
+        return str(item_type or "").endswith("NetworkDot")
+
+    def _collapse_network_dot_connections(self, connections: Sequence[Dict[str, Any]], dot_paths: set) -> List[Dict[str, Any]]:
+        """Rewrite connections so wires routed through network dots read as direct node-to-node links."""
+        if not dot_paths:
+            return list(connections)
+
+        incoming_by_dot: Dict[str, Dict[str, Any]] = {}
+        for connection in connections:
+            target_path = _connection_endpoint_path(connection, "target")
+            if target_path in dot_paths:
+                existing = incoming_by_dot.get(target_path)
+                if existing is None or str(connection.get("key", "")) < str(existing.get("key", "")):
+                    incoming_by_dot[target_path] = connection
+
+        def resolve_upstream(dot_path: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+            via: List[str] = []
+            current = dot_path
+            while current in dot_paths:
+                if current in via:
+                    return None, via  # Cycle of dots; drop rather than loop forever.
+                via.append(current)
+                connection = incoming_by_dot.get(current)
+                if connection is None:
+                    return None, via  # Dangling dot with no input.
+                source_path = _connection_endpoint_path(connection, "source")
+                if source_path in dot_paths:
+                    current = source_path
+                    continue
+                return connection, via
+            return None, via
+
+        records: List[Dict[str, Any]] = []
+        keys: set = set()
+        for connection in connections:
+            source_path = _connection_endpoint_path(connection, "source")
+            target_path = _connection_endpoint_path(connection, "target")
+            if target_path in dot_paths:
+                continue  # Re-emitted from the dot's outgoing side as a collapsed connection.
+            if source_path not in dot_paths:
+                key = connection.get("key")
+                if key and key in keys:
+                    continue
+                if key:
+                    keys.add(key)
+                records.append(connection)
+                continue
+            upstream, via = resolve_upstream(source_path)
+            if upstream is not None:
+                source = dict(upstream.get("source", {}) or {})
+            else:
+                # No dot-to-dot segments were collected (hou dots expose no
+                # inputConnections). hou already resolves the real upstream
+                # node into NodeConnection.inputNode(), recorded as source.node.
+                upstream_node = (connection.get("source", {}) or {}).get("node")
+                if not upstream_node or upstream_node in dot_paths:
+                    continue
+                source = dict(connection.get("source", {}) or {})
+                source["item"] = upstream_node
+                if source.get("node_output_index") is not None:
+                    source["output_index"] = source["node_output_index"]
+            target = dict(connection.get("target", {}) or {})
+            key = "%s:%s->%s:%s" % (
+                source.get("item") or source.get("node"),
+                source.get("output_index"),
+                target.get("item") or target.get("node"),
+                target.get("input_index"),
+            )
+            if key in keys:
+                continue
+            keys.add(key)
+            records.append(
+                {
+                    "key": key,
+                    "source": source,
+                    "target": target,
+                    "subnet_indirect_input": None,
+                    "selected": None,
+                    "class": "CollapsedDotConnection",
+                    "synthetic": True,
+                    "reason": "network_dots_collapsed",
+                    "via_dots": list(reversed(via)),
+                }
+            )
         records.sort(key=lambda row: str(row.get("key", "")))
         return records
 
@@ -893,9 +1036,12 @@ class HoudiniSceneExporter:
         subnet_indirect = self._safe_method(connection, "subnetIndirectInput", None)
         source_path = _path_of(input_item) or _path_of(input_node)
         target_path = _path_of(output_item) or _path_of(output_node)
-        source_output_index = self._safe_method(connection, "inputItemOutputIndex", None)
-        if source_output_index is None:
-            source_output_index = self._safe_method(connection, "outputIndex", None)
+        item_output_index = self._try_method(connection, "inputItemOutputIndex", None)
+        # outputIndex() resolves through network dots to the real upstream node's
+        # output, while inputItemOutputIndex() reports the immediate item's output
+        # (always 0 when the wire arrives via a dot).
+        node_output_index = self._try_method(connection, "outputIndex", None)
+        source_output_index = item_output_index if item_output_index is not None else node_output_index
         target_input_index = self._safe_method(connection, "inputIndex", None)
         key = "%s:%s->%s:%s" % (source_path, source_output_index, target_path, target_input_index)
         return {
@@ -904,16 +1050,17 @@ class HoudiniSceneExporter:
                 "node": _path_of(input_node),
                 "item": source_path,
                 "output_index": source_output_index,
-                "output_name": self._safe_method(connection, "inputName", None),
-                "output_label": self._safe_method(connection, "inputLabel", None),
+                "node_output_index": node_output_index,
+                "output_name": self._try_method(connection, "inputName", None),
+                "output_label": self._try_method(connection, "inputLabel", None),
                 "output_data_type": self._try_method(connection, "inputDataType", None),
             },
             "target": {
                 "node": _path_of(output_node),
                 "item": target_path,
                 "input_index": target_input_index,
-                "input_name": self._safe_method(connection, "outputName", None),
-                "input_label": self._safe_method(connection, "outputLabel", None),
+                "input_name": self._try_method(connection, "outputName", None),
+                "input_label": self._try_method(connection, "outputLabel", None),
                 "input_data_type": self._try_method(connection, "outputDataType", None),
             },
             "subnet_indirect_input": _path_of(subnet_indirect),
@@ -976,7 +1123,9 @@ class HoudiniSceneExporter:
             "path": self._safe_method(parm_tuple, "path", None),
             "folders": self._parm_tuple_folders(parms),
             "template": self._parm_template_record(template),
-            "is_at_default": self._safe_method(parm_tuple, "isAtDefault", None) if self.include_parameter_state else None,
+            "is_at_default": self._try_method(parm_tuple, "isAtDefault", None)
+            if (self.evaluate_parameters or self.include_parameter_state or self.changed_only)
+            else None,
             "is_time_dependent": self._safe_method(parm_tuple, "isTimeDependent", None) if self.include_parameter_state else None,
             "state_evaluated": self.include_parameter_state,
             "values": values,
@@ -1410,7 +1559,15 @@ class HoudiniSceneExporter:
         if self.geometry_sample_count == 0:
             return []
         if owner == "global":
-            return [{"value": _as_plain(self._try_method(geometry, "attribValue", None, attrib), self.max_text_chars)}]
+            value = self._try_method(geometry, "attribValue", None, attrib)
+            if value is None:
+                # Some attrib kinds only resolve by name (and dict attribs need dictValue).
+                name = self._try_method(attrib, "name", None)
+                if name:
+                    value = self._try_method(geometry, "attribValue", None, name)
+                    if value is None:
+                        value = self._try_method(geometry, "dictValue", None, name)
+            return [{"value": _as_plain(value, self.max_text_chars)}]
         if owner == "vertex":
             return self._vertex_attribute_sample_values(attrib, elements)
         samples = []
@@ -1519,10 +1676,21 @@ class HoudiniSceneExporter:
         groups = self._try_method(geometry, method_name, ())
         records = []
         for group in groups or ():
+            count = self._try_method(group, "size", None)
+            if count is None:
+                # Older hou.Group classes have no size(); count the members instead.
+                for items_method in ("points", "prims", "vertices", "edges"):
+                    items = self._try_method(group, items_method, None)
+                    if items is not None:
+                        try:
+                            count = len(items)
+                        except Exception:
+                            count = None
+                        break
             records.append(
                 {
                     "name": self._try_method(group, "name", None),
-                    "count": self._try_method(group, "size", None),
+                    "count": count,
                     "is_ordered": self._try_method(group, "isOrdered", None),
                     "scope": _enum_to_string(self._try_method(group, "scope", None)),
                     "type": group.__class__.__name__,
@@ -1531,34 +1699,141 @@ class HoudiniSceneExporter:
         return records
 
 
+def _houdini_version_suffix(data: Dict[str, Any]) -> str:
+    version = (data.get("scene", {}) or {}).get("houdini_version")
+    if not version:
+        return ""
+    return " (Houdini %s)" % version
+
+
+def _llm_footer_lines(data: Dict[str, Any]) -> List[str]:
+    version = (data.get("scene", {}) or {}).get("houdini_version")
+    label = "Houdini %s" % version if version else "Houdini"
+    return [
+        "",
+        "---",
+        "",
+        "**アシスタントへ:** 上記はユーザーの現在の %s ネットワークのスナップショットです。"
+        "回答は必ずこのダンプに基づいてください。ノードは上記の正確な名前・パスで参照し、"
+        "記載された値を現在の状態として扱い、記載のないパラメータは Houdini のデフォルト値とみなしてください。"
+        "接続に沿ってデータフローを追い、ノードの仕様に少しでも不確かさがあれば SideFX の最新公式ドキュメントを調べ、"
+        "正しい Houdini / VEX の知識に基づいて分析してください。"
+        "このダンプに無い情報は推測せず「不明」と答えてください。" % label,
+    ]
+
+
+# Node-type importance for ordering the per-node sections. LLM attention is
+# strongest at the start and end of long context, so high-signal nodes
+# (solvers, wrangles, fracture setups) go to both ends and plumbing/primitive
+# nodes (box, merge, transform, ...) sink to the middle.
+_COMPACT_TYPE_IMPORTANCE = (
+    (100, ("solver", "dopnet", "dopimport", "simulation")),
+    (90, ("wrangle", "python", "opencl", "vopnet", "attribvop", "snippet")),
+    (75, ("fracture", "constraint", "configure", "vellum", "pyro", "flip", "popnet", "boolean")),
+    (60, ("filecache", "rop_", "cache", "bake", "output")),
+    (50, ("copytopoints", "copy", "scatter", "foreach", "block_begin", "block_end", "switch")),
+    (10, (
+        "merge", "null", "name", "transform", "xform", "unpack", "pack",
+        "box", "sphere", "grid", "tube", "line", "circle", "platonic", "font",
+        "blast", "clip", "delete", "group",
+    )),
+)
+
+
+def _compact_node_importance(node: Dict[str, Any]) -> int:
+    node_type = node.get("type", {}) or {}
+    type_text = _node_type_token(node_type.get("name_with_category") or node_type.get("name"))
+    score = 30
+    for tier_score, keywords in _COMPACT_TYPE_IMPORTANCE:
+        if any(keyword in type_text for keyword in keywords):
+            score = tier_score
+            break
+    if node.get("code_blocks"):
+        score = max(score, 85)
+    flags = node.get("flags", {}) or {}
+    if flags.get("isDisplayFlagSet") is True or flags.get("isRenderFlagSet") is True:
+        score += 8
+    changed = sum(1 for parm_tuple in node.get("parameters", []) or [] if parm_tuple.get("is_at_default") is False)
+    score += min(changed, 10)
+    if node.get("comment"):
+        score += 5
+    return score
+
+
+# Nodes at or above this importance score also list their leading default
+# parameters, so e.g. a solver left entirely at defaults still shows its core
+# settings (Houdini puts the most relevant parameters first in the interface).
+COMPACT_IMPORTANT_SCORE = 70
+DEFAULT_COMPACT_IMPORTANT_PARAM_FLOOR = 10
+
+
+def _compact_default_parameter_chunks(
+    parameters: Sequence[Dict[str, Any]],
+    limit: int,
+    max_per_line: int = 6,
+) -> List[str]:
+    if limit <= 0:
+        return []
+    ramp_names = {
+        str(parm_tuple.get("name"))
+        for parm_tuple in parameters
+        if (parm_tuple.get("template", {}) or {}).get("class") == "RampParmTemplate"
+    }
+    entries: List[str] = []
+    for parm_tuple in parameters:
+        if parm_tuple.get("is_at_default") is not True:
+            continue
+        template = parm_tuple.get("template", {}) or {}
+        if template.get("class") in _ULTRA_UI_NOISE_TEMPLATE_CLASSES:
+            continue
+        if template.get("class") == "RampParmTemplate" or _compact_folder_is_noise(template):
+            continue
+        name = str(parm_tuple.get("name") or "")
+        if ramp_names:
+            match = _RAMP_INSTANCE_PATTERN.match(name)
+            if match and match.group("base") in ramp_names:
+                continue
+        entry = _compact_parameter_entry(parm_tuple)
+        if entry:
+            entries.append(entry)
+        if len(entries) >= limit:
+            break
+    chunks = []
+    for index in range(0, len(entries), max_per_line):
+        chunks.append("; ".join(entries[index : index + max_per_line]))
+    return chunks
+
+
+def _attention_ordered_nodes(nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Order nodes so importance is highest at the start and end, lowest in the middle."""
+    ranked = sorted(nodes, key=lambda node: (-_compact_node_importance(node), str(node.get("path", ""))))
+    front: List[Dict[str, Any]] = []
+    back: List[Dict[str, Any]] = []
+    for index, node in enumerate(ranked):
+        if index % 2 == 0:
+            front.append(node)
+        else:
+            back.append(node)
+    return front + list(reversed(back))
+
+
 def render_compact_markdown(data: Dict[str, Any]) -> str:
     nodes = sorted(data.get("nodes", []), key=lambda row: str(row.get("path", "")))
     connections = data.get("connections", [])
     code_blocks = data.get("code_blocks", [])
+    node_info = _compact_node_info(nodes)
 
     lines: List[str] = []
-    lines.append("# Houdini Scene Summary")
+    lines.append("# Houdini Scene Summary%s" % _houdini_version_suffix(data))
     lines.append("")
-    lines.append("- Connection notation: `A to B` means A is connected to B.")
+    lines.append("- Connection notation: `A -> B -> C` means each node's first output feeds the next node's first input; other ports are marked like `[output2]` / `[input3: Constraint Geometry]`.")
     lines.append("")
 
     lines.append("## Connections")
     lines.append("")
-    if connections:
-        for connection in connections:
-            src = connection.get("source", {})
-            dst = connection.get("target", {})
-            src_port = src.get("output_name") or src.get("output_index")
-            dst_port = dst.get("input_name") or dst.get("input_index")
-            lines.append(
-                "- `%s`[%s] to `%s`[%s]"
-                % (
-                    src.get("item") or src.get("node"),
-                    src_port,
-                    dst.get("item") or dst.get("node"),
-                    dst_port,
-                )
-            )
+    connection_lines = _compact_connection_lines(connections, node_info, nodes)
+    if connection_lines:
+        lines.extend(connection_lines)
     else:
         lines.append("(none)")
     lines.append("")
@@ -1566,15 +1841,19 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
     lines.append("## Inspector Settings")
     lines.append("")
     inline_code_keys = set()
-    for node in nodes:
+    for node in _attention_ordered_nodes(nodes):
         if _node_type_record_suppresses_parameters(node.get("type", {})):
             continue
         code_refs = [block for block in node.get("code_blocks", []) if block.get("node_path") == node.get("path")]
         comment = node.get("comment")
         node_type = node.get("type", {}).get("name_with_category") or node.get("type", {}).get("name")
+        type_description = node.get("type", {}).get("description")
         is_wrangle = _compact_is_wrangle_node(node)
         param_chunks = [] if is_wrangle else _compact_parameter_chunks(node.get("parameters", []))
-        lines.append("### `%s` type=`%s`" % (node.get("path"), node_type))
+        heading = "### `%s` type=`%s`" % (node.get("path"), node_type)
+        if type_description and _compact_condense(type_description) != _compact_condense(_node_type_token(node_type)):
+            heading += " (%s)" % type_description
+        lines.append(heading)
         flags = _compact_true_flags(node.get("flags", {}))
         if flags:
             lines.append("- Flags: `%s`" % ",".join(flags))
@@ -1587,6 +1866,16 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
         if param_chunks:
             for chunk in param_chunks:
                 lines.append("- Params: %s" % chunk)
+        if not is_wrangle and _compact_node_importance(node) >= COMPACT_IMPORTANT_SCORE:
+            # Count only the entries actually rendered, not hidden folder/ramp noise;
+            # otherwise nodes full of "changed" folder parms never get their Defaults floor.
+            changed_count = len(_compact_parameter_entries(node.get("parameters", []) or []))
+            default_chunks = _compact_default_parameter_chunks(
+                node.get("parameters", []) or [],
+                DEFAULT_COMPACT_IMPORTANT_PARAM_FLOOR - changed_count,
+            )
+            for chunk in default_chunks:
+                lines.append("- Defaults: %s" % chunk)
         visible_code_refs = [block for block in code_refs if _compact_code_key(block) not in inline_code_keys]
         if visible_code_refs:
             refs = ", ".join("`%s`" % (block.get("parm_path") or block.get("parm_name")) for block in visible_code_refs)
@@ -1621,14 +1910,203 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
             lines.append("- ... %d more errors omitted" % (len(errors) - 100))
         lines.append("")
 
+    lines.extend(_llm_footer_lines(data))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _compact_node_info(nodes: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    info: Dict[str, Dict[str, Any]] = {}
+    for node in nodes:
+        path = node.get("path")
+        if not path:
+            continue
+        node_type = node.get("type", {}) or {}
+        info[str(path)] = {
+            "name": node.get("name") or str(path).rsplit("/", 1)[-1],
+            "type_name": node_type.get("name"),
+            "type_label": node_type.get("description") or node_type.get("name"),
+        }
+    return info
+
+
+def _compact_condense(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _compact_name_matches_type(name: Any, info: Dict[str, Any]) -> bool:
+    base = re.sub(r"[\d_]+$", "", str(name or "").lower())
+    condensed_name = _compact_condense(base)
+    if not condensed_name:
+        return False
+    candidates = {
+        _compact_condense(_node_type_token(info.get("type_name"))),
+        _compact_condense(info.get("type_label")),
+    }
+    candidates.discard("")
+    return any(condensed_name.startswith(candidate) for candidate in candidates)
+
+
+def _compact_node_ref(path: Optional[str], parent: str, node_info: Dict[str, Dict[str, Any]]) -> str:
+    if not path:
+        return "`?`"
+    display = str(path)
+    parent_prefix = parent.rstrip("/") + "/"
+    if display.startswith(parent_prefix):
+        display = display[len(parent_prefix):]
+    info = node_info.get(str(path))
+    if info is None or _compact_name_matches_type(info.get("name"), info):
+        return "`%s`" % display
+    return "`%s` (%s)" % (display, info.get("type_label") or "?")
+
+
+def _compact_port_is_primary(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return int(value) == 0
+    except Exception:
+        return False
+
+
+def _compact_port_text(direction: str, endpoint: Dict[str, Any]) -> str:
+    name = endpoint.get("%s_name" % direction)
+    label = endpoint.get("%s_label" % direction)
+    index = endpoint.get("%s_index" % direction)
+    token = str(name).strip() if name not in (None, "") else ""
+    if not token:
+        token = "%s %s" % (direction, index)
+    elif direction not in token.lower():
+        token = "%s %s" % (direction, token)
+    label_text = str(label).strip() if label not in (None, "") else ""
+    if (
+        label_text
+        and not label_text.lower().startswith(direction)
+        and _compact_condense(label_text) != _compact_condense(token)
+    ):
+        if len(label_text) > 60:
+            label_text = label_text[:57].rstrip() + "..."
+        token = "%s: %s" % (token, label_text)
+    return "[%s]" % token
+
+
+def _compact_connection_lines(
+    connections: Sequence[Dict[str, Any]],
+    node_info: Dict[str, Dict[str, Any]],
+    nodes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[str]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    connected_paths: set = set()
+    for connection in connections:
+        anchor = _connection_endpoint_path(connection, "target") or _connection_endpoint_path(connection, "source")
+        if not anchor:
+            continue
+        parent = str(anchor).rsplit("/", 1)[0] or "/"
+        groups.setdefault(parent, []).append(connection)
+        for endpoint_name in ("source", "target"):
+            path = _connection_endpoint_path(connection, endpoint_name)
+            if path:
+                connected_paths.add(path)
+
+    nodes_by_parent: Dict[str, List[str]] = {}
+    for node in nodes or ():
+        path = node.get("path")
+        if not path:
+            continue
+        parent = str(path).rsplit("/", 1)[0] or "/"
+        nodes_by_parent.setdefault(parent, []).append(str(path))
+
+    lines: List[str] = []
+    show_headings = len(groups) > 1
+    for parent in sorted(groups):
+        if show_headings:
+            if lines:
+                lines.append("")
+            lines.append("### `%s`" % parent)
+        chain_edges: List[Tuple[str, str]] = []
+        port_connections: List[Dict[str, Any]] = []
+        for connection in groups[parent]:
+            source = connection.get("source", {}) or {}
+            target = connection.get("target", {}) or {}
+            source_path = _connection_endpoint_path(connection, "source")
+            target_path = _connection_endpoint_path(connection, "target")
+            if not source_path or not target_path:
+                continue
+            if _compact_port_is_primary(source.get("output_index")) and _compact_port_is_primary(target.get("input_index")):
+                chain_edges.append((source_path, target_path))
+            else:
+                port_connections.append(connection)
+
+        chain_lines = []
+        for chain in _compact_chains(chain_edges):
+            chain_lines.append("- " + " -> ".join(_compact_node_ref(path, parent, node_info) for path in chain))
+        lines.extend(sorted(chain_lines))
+
+        port_lines = []
+        for connection in port_connections:
+            source = connection.get("source", {}) or {}
+            target = connection.get("target", {}) or {}
+            pieces = [_compact_node_ref(_connection_endpoint_path(connection, "source"), parent, node_info)]
+            if not _compact_port_is_primary(source.get("output_index")):
+                pieces.append(_compact_port_text("output", source))
+            pieces.append("->")
+            pieces.append(_compact_node_ref(_connection_endpoint_path(connection, "target"), parent, node_info))
+            if not _compact_port_is_primary(target.get("input_index")):
+                pieces.append(_compact_port_text("input", target))
+            port_lines.append("- " + " ".join(pieces))
+        lines.extend(sorted(port_lines))
+
+        unwired = sorted(path for path in nodes_by_parent.get(parent, []) if path not in connected_paths)
+        if unwired:
+            refs = ", ".join(_compact_node_ref(path, parent, node_info) for path in unwired)
+            lines.append("- Not wired: %s" % refs)
+    return lines
+
+
+def _compact_chains(edges: Sequence[Tuple[str, str]]) -> List[List[str]]:
+    unique_edges = sorted(set(edges))
+    out_edges: Dict[str, List[str]] = {}
+    in_count: Dict[str, int] = {}
+    for source, target in unique_edges:
+        out_edges.setdefault(source, []).append(target)
+        in_count[target] = in_count.get(target, 0) + 1
+
+    def is_pass_through(path: str) -> bool:
+        return len(out_edges.get(path, [])) == 1 and in_count.get(path, 0) == 1
+
+    chains: List[List[str]] = []
+    covered: set = set()
+    for source, target in unique_edges:
+        if is_pass_through(source):
+            continue  # This edge is emitted as part of the chain that flows through `source`.
+        chain = [source, target]
+        covered.add((source, target))
+        seen = {source, target}
+        current = target
+        while is_pass_through(current):
+            next_path = out_edges[current][0]
+            if next_path in seen:
+                break
+            covered.add((current, next_path))
+            chain.append(next_path)
+            seen.add(next_path)
+            current = next_path
+        chains.append(chain)
+
+    for source, target in unique_edges:
+        if (source, target) not in covered:
+            chains.append([source, target])
+    return chains
 
 
 def _compact_true_flags(flags: Dict[str, Any]) -> List[str]:
     interesting = []
-    for key in ("isDisplayFlagSet", "isRenderFlagSet", "isTemplateFlagSet", "isBypassed", "isHardLocked", "isSoftLocked", "isLockedHDA"):
+    # isLockedHDA is omitted: every stock HDA instance reports it, so it carries no signal.
+    for key in ("isDisplayFlagSet", "isRenderFlagSet", "isTemplateFlagSet", "isBypassed", "isHardLocked", "isSoftLocked"):
         if flags.get(key) is True:
-            interesting.append(key.replace("is", "").replace("FlagSet", "").replace("Set", ""))
+            name = key[2:] if key.startswith("is") else key
+            if name.endswith("FlagSet"):
+                name = name[: -len("FlagSet")]
+            interesting.append(name)
     return interesting
 
 
@@ -1636,6 +2114,15 @@ def _compact_is_wrangle_node(node: Dict[str, Any]) -> bool:
     node_type = node.get("type", {})
     text = " ".join(str(node_type.get(key) or "") for key in ("name", "name_with_category", "description")).lower()
     return "wrangle" in text
+
+
+# Built-in wrangle parms already covered by the Run over / Group / VEX lines or
+# that only tune VEX compilation; anything else on a wrangle is a user-made spare
+# parm referenced by ch()/chv()/chf() in the snippet, so its value matters.
+_WRANGLE_BUILTIN_PARM_NAMES = {
+    "group", "grouptype", "class", "snippet", "exportlist", "autobind",
+    "groupbindings", "bindings", "nattribs", "vexpression",
+}
 
 
 def _compact_wrangle_lines(node: Dict[str, Any]) -> Tuple[List[str], set]:
@@ -1650,6 +2137,15 @@ def _compact_wrangle_lines(node: Dict[str, Any]) -> Tuple[List[str], set]:
     group_value = _compact_parameter_scalar(_compact_parameter_by_name(parameters, "group"))
     if isinstance(group_value, str) and group_value:
         lines.append("- Group: `%s`" % _inline_text(group_value, 160))
+
+    spare_parameters = [
+        parm_tuple
+        for parm_tuple in parameters
+        if str(parm_tuple.get("name") or "") not in _WRANGLE_BUILTIN_PARM_NAMES
+        and not str(parm_tuple.get("name") or "").startswith(("vex_", "bind"))
+    ]
+    for chunk in _compact_parameter_chunks(spare_parameters, include_labels=True):
+        lines.append("- Params: %s" % chunk)
 
     snippet = _compact_parameter_scalar(_compact_parameter_by_name(parameters, "snippet"))
     if isinstance(snippet, str) and snippet:
@@ -1734,16 +2230,54 @@ def _compact_code_key(block: Dict[str, Any]) -> Tuple[Any, Any, Any]:
     return (block.get("node_path"), block.get("parm_path"), block.get("tuple_name") or block.get("parm_name"))
 
 
+_RAMP_INSTANCE_PATTERN = re.compile(r"^(?P<base>.+?)(?P<index>\d+)(?P<channel>pos|value|interp|c)$")
+
+
+def _compact_folder_is_noise(template: Dict[str, Any]) -> bool:
+    """Folder open/close state parms carry no scene meaning; multiparm counts do."""
+    if template.get("class") not in ("FolderParmTemplate", "FolderSetParmTemplate"):
+        return False
+    folder_type = str(template.get("folder_type") or "")
+    return "Multiparm" not in folder_type and "RadioButtons" not in folder_type
+
+
+def _compact_ramp_number(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return "(" + ",".join(_compact_ramp_number(v) for v in value) + ")"
+    if isinstance(value, float):
+        return "%g" % value
+    if value is None:
+        return "?"
+    return str(value)
+
+
+def _compact_ramp_summary(instances: Dict[int, Dict[str, Any]]) -> Optional[str]:
+    if not instances:
+        return None
+    interps = {str(inst.get("interp")) for inst in instances.values() if inst.get("interp") is not None}
+    uniform_interp = interps.pop() if len(interps) == 1 else None
+    pieces = []
+    for index in sorted(instances):
+        inst = instances[index]
+        pos = _compact_ramp_number(inst.get("pos"))
+        value = _compact_ramp_number(inst.get("value") if "value" in inst else inst.get("c"))
+        if uniform_interp is not None or inst.get("interp") is None:
+            pieces.append("(%s, %s)" % (pos, value))
+        else:
+            pieces.append("(%s, %s, %s)" % (pos, value, inst.get("interp")))
+    text = "ramp " + " ".join(pieces)
+    if uniform_interp:
+        text += " @ %s" % uniform_interp
+    return text
+
+
 def _compact_parameter_chunks(
     parameters: Sequence[Dict[str, Any]],
     max_per_line: int = 6,
     max_params: int = DEFAULT_COMPACT_PARAMETER_LIMIT,
+    include_labels: bool = False,
 ) -> List[str]:
-    entries = []
-    for parm_tuple in parameters:
-        entry = _compact_parameter_entry(parm_tuple)
-        if entry:
-            entries.append(entry)
+    entries = _compact_parameter_entries(parameters, include_labels)
     if max_params >= 0 and len(entries) > max_params:
         omitted = len(entries) - max_params
         entries = entries[:max_params]
@@ -1754,17 +2288,85 @@ def _compact_parameter_chunks(
     return chunks
 
 
-def _compact_parameter_entry(parm_tuple: Dict[str, Any]) -> Optional[str]:
+def _compact_parameter_entries(
+    parameters: Sequence[Dict[str, Any]],
+    include_labels: bool = False,
+) -> List[str]:
+    ramp_names = {
+        str(parm_tuple.get("name"))
+        for parm_tuple in parameters
+        if (parm_tuple.get("template", {}) or {}).get("class") == "RampParmTemplate"
+    }
+    ramp_instances: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    ramp_changed: set = set()
+    for parm_tuple in parameters:
+        name = str(parm_tuple.get("name") or "")
+        if name in ramp_names:
+            if parm_tuple.get("is_at_default") is False:
+                ramp_changed.add(name)
+            continue
+        if not ramp_names:
+            continue
+        match = _RAMP_INSTANCE_PATTERN.match(name)
+        if not match or match.group("base") not in ramp_names:
+            continue
+        base = match.group("base")
+        channel = match.group("channel")
+        slot = ramp_instances.setdefault(base, {}).setdefault(int(match.group("index")), {})
+        if channel == "interp":
+            label = _compact_menu_value_label(parm_tuple, _compact_parameter_scalar(parm_tuple))
+            slot[channel] = label if label is not None else _compact_parameter_scalar(parm_tuple)
+        else:
+            slot[channel] = _compact_parameter_scalar(parm_tuple)
+        if parm_tuple.get("is_at_default") is False:
+            ramp_changed.add(base)
+
+    entries = []
+    emitted_ramps: set = set()
+    for parm_tuple in parameters:
+        name = str(parm_tuple.get("name") or "")
+        template = parm_tuple.get("template", {}) or {}
+        if _compact_folder_is_noise(template):
+            continue
+        if name in ramp_names:
+            if name in ramp_changed and name not in emitted_ramps:
+                summary = _compact_ramp_summary(ramp_instances.get(name, {}))
+                if summary:
+                    entries.append("`%s`=`%s`" % (name, summary))
+            emitted_ramps.add(name)
+            continue
+        if ramp_names:
+            match = _RAMP_INSTANCE_PATTERN.match(name)
+            if match and match.group("base") in ramp_names:
+                continue
+        if parm_tuple.get("is_at_default") is True:
+            continue
+        entry = _compact_parameter_entry(parm_tuple, include_labels)
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+def _compact_parameter_entry(parm_tuple: Dict[str, Any], include_label: bool = False) -> Optional[str]:
     name = parm_tuple.get("name")
     if not name:
         return None
     value = _compact_parameter_value(parm_tuple)
     if value is None:
         return None
+    if include_label:
+        label = parm_tuple.get("label")
+        if label and _compact_condense(label) != _compact_condense(str(name)):
+            return "`%s` (%s) = %s" % (name, label, value)
     return "`%s`=%s" % (name, value)
 
 
 def _compact_parameter_value(parm_tuple: Dict[str, Any]) -> Optional[str]:
+    template = parm_tuple.get("template", {}) or {}
+    if template.get("menu_items") or template.get("menu_labels"):
+        menu_label = _compact_menu_value_label(parm_tuple, _compact_parameter_scalar(parm_tuple))
+        if menu_label is not None:
+            return _compact_value_text(menu_label)
     if parm_tuple.get("values_evaluated") and parm_tuple.get("values") is not None:
         return _compact_value_text(parm_tuple.get("values"))
     values = []
@@ -1803,23 +2405,239 @@ def _compact_plain_text(value: Any, limit: int = 160) -> str:
     return text
 
 
+DEFAULT_ULTRA_MAX_RUNS = 2000
+DEFAULT_ULTRA_SAMPLE_COUNT = 5
+
+
+def _ultra_value_text(value: Any) -> str:
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    return _compact_ramp_number(value)
+
+
+def _ultra_compress_values(values: Sequence[Any]) -> List[str]:
+    """Run-length encode consecutive equal values: 0.5, 0.5, 0.5 -> `0.5 (x3)`."""
+    pieces: List[str] = []
+    run_text: Optional[str] = None
+    run_count = 0
+    for value in values:
+        text = _ultra_value_text(value)
+        if text == run_text:
+            run_count += 1
+            continue
+        if run_text is not None:
+            pieces.append(run_text if run_count == 1 else "%s (x%d)" % (run_text, run_count))
+        run_text = text
+        run_count = 1
+    if run_text is not None:
+        pieces.append(run_text if run_count == 1 else "%s (x%d)" % (run_text, run_count))
+    return pieces
+
+
+_ULTRA_UI_NOISE_TEMPLATE_CLASSES = ("SeparatorParmTemplate", "LabelParmTemplate", "ButtonParmTemplate")
+
+
+def _ultra_parameter_lines(parameters: Sequence[Dict[str, Any]]) -> List[str]:
+    visible: List[Dict[str, Any]] = []
+    for parm_tuple in parameters:
+        template = parm_tuple.get("template", {}) or {}
+        if template.get("class") in _ULTRA_UI_NOISE_TEMPLATE_CLASSES:
+            continue
+        if _compact_folder_is_noise(template):
+            continue
+        visible.append(parm_tuple)
+    default_count = sum(1 for parm_tuple in visible if parm_tuple.get("is_at_default") is True)
+
+    lines: List[str] = []
+    chunks = _compact_parameter_chunks(visible, max_per_line=1, max_params=-1, include_labels=True)
+    if chunks:
+        lines.append("- Parameters (changed from defaults):")
+        for chunk in chunks:
+            lines.append("  - %s" % chunk)
+    for parm_tuple in visible:
+        for parm in parm_tuple.get("parms", []) or []:
+            expression = parm.get("expression")
+            if expression:
+                lines.append("  - `%s` expression: `%s`" % (parm.get("name"), _inline_text(str(expression), 200)))
+            keyframes = parm.get("keyframes")
+            if keyframes:
+                lines.append("  - `%s` keyframes: %d" % (parm.get("name"), len(keyframes)))
+    if default_count:
+        lines.append("- %d parameters at default omitted (full values are in the JSON export)" % default_count)
+    return lines
+
+
+def _ultra_attribute_lines(owner: str, attrib: Dict[str, Any], total_elements: Any) -> List[str]:
+    name = attrib.get("name")
+    type_text = str(attrib.get("data_type") or attrib.get("type") or "?")
+    if "." in type_text:
+        type_text = type_text.rsplit(".", 1)[-1]
+    type_text = type_text.lower()
+    size = attrib.get("size")
+    try:
+        if size is not None and int(size) > 1:
+            type_text += "[%s]" % size
+    except Exception:
+        pass
+    if attrib.get("is_array"):
+        type_text += " array"
+    scope = attrib.get("scope")
+    scope_text = "" if scope in (None, "public", "default") else " scope=%s" % scope
+
+    samples = attrib.get("sample_values") or []
+    values = [sample.get("value") for sample in samples]
+    lines = ["#### %s `%s` (%s)%s" % (owner, name, type_text, scope_text), ""]
+    if not values:
+        lines.append("(values not captured)")
+        lines.append("")
+        return lines
+
+    note = ""
+    try:
+        if total_elements is not None and len(values) < int(total_elements):
+            note = "first %d of %s elements" % (len(values), total_elements)
+    except Exception:
+        pass
+
+    pieces = _ultra_compress_values(values)
+    omitted_runs = 0
+    if len(pieces) > DEFAULT_ULTRA_MAX_RUNS:
+        omitted_runs = len(pieces) - DEFAULT_ULTRA_MAX_RUNS
+        pieces = pieces[:DEFAULT_ULTRA_MAX_RUNS]
+    if note:
+        lines.append("(%s)" % note)
+    lines.append("```text")
+    for index in range(0, len(pieces), 8):
+        lines.append(", ".join(pieces[index : index + 8]))
+    if omitted_runs:
+        lines.append("... +%d more runs omitted" % omitted_runs)
+    lines.append("```")
+    lines.append("")
+    return lines
+
+
+_ULTRA_OWNER_PLURALS = {"point": "points", "vertex": "vertices", "primitive": "primitives", "edge": "edges"}
+
+
+def _ultra_group_lines(owner: str, record: Dict[str, Any], total_elements: Any) -> List[str]:
+    plural = _ULTRA_OWNER_PLURALS.get(owner, owner + "s")
+    count = record.get("count")
+    if count is None:
+        size_text = "size unknown"
+    elif total_elements not in (None, 0):
+        size_text = "%s of %s %s" % (count, total_elements, plural)
+    else:
+        size_text = "%s %s" % (count, plural)
+    suffix = ", ordered" if record.get("is_ordered") else ""
+    return ["#### %s group `%s` (%s%s)" % (owner, record.get("name"), size_text, suffix), ""]
+
+
+def _ultra_geometry_lines(summary: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    counts = summary.get("counts", {}) or {}
+    lines.append(
+        "- Geometry: points=`%s`, vertices=`%s`, primitives=`%s`"
+        % (counts.get("points"), counts.get("vertices"), counts.get("primitives"))
+    )
+    lines.append("")
+
+    element_totals = {
+        "point": counts.get("points"),
+        "vertex": counts.get("vertices"),
+        "primitive": counts.get("primitives"),
+        "global": 1,
+    }
+    attributes = summary.get("attributes", {}) or {}
+    groups = summary.get("groups", {}) if isinstance(summary.get("groups", {}), dict) else {}
+    for owner in ("point", "vertex", "primitive", "global"):
+        for record in groups.get(owner, []) or []:
+            lines.extend(_ultra_group_lines(owner, record, element_totals.get(owner)))
+        for attrib in attributes.get(owner, []) or []:
+            lines.extend(_ultra_attribute_lines(owner, attrib, element_totals.get(owner)))
+    for record in groups.get("edge", []) or []:
+        lines.extend(_ultra_group_lines("edge", record, None))
+
+    omitted = summary.get("omitted_standard_attributes", {}) or {}
+    omitted_pieces = []
+    if isinstance(omitted, dict):
+        for owner in ("point", "vertex", "primitive", "global"):
+            for record in omitted.get(owner, []) or []:
+                omitted_pieces.append("%s %s" % (owner, record.get("name")))
+    if omitted_pieces:
+        lines.append("- Standard attributes omitted: `%s`" % "`, `".join(omitted_pieces))
+        lines.append("")
+    return lines
+
+
+def render_ultra_markdown(data: Dict[str, Any]) -> str:
+    nodes = sorted(data.get("nodes", []), key=lambda row: str(row.get("path", "")))
+    node_info = _compact_node_info(nodes)
+
+    lines: List[str] = []
+    lines.append("# Houdini Attribute Report%s" % _houdini_version_suffix(data))
+    lines.append("")
+    lines.append("- Attribute values are listed in element order; `value (xN)` means N consecutive elements share that value.")
+    lines.append("")
+
+    connection_lines = _compact_connection_lines(data.get("connections", []), node_info, nodes)
+    if connection_lines:
+        lines.append("## Connections")
+        lines.append("")
+        lines.extend(connection_lines)
+        lines.append("")
+
+    for node in _attention_ordered_nodes(nodes):
+        node_type_record = node.get("type", {}) or {}
+        node_type = node_type_record.get("name_with_category") or node_type_record.get("name")
+        type_description = node_type_record.get("description")
+        heading = "## `%s` type=`%s`" % (node.get("path"), node_type)
+        if type_description and _compact_condense(type_description) != _compact_condense(_node_type_token(node_type)):
+            heading += " (%s)" % type_description
+        lines.append(heading)
+        lines.append("")
+        flags = _compact_true_flags(node.get("flags", {}) or {})
+        if flags:
+            lines.append("- Flags: `%s`" % ",".join(flags))
+        comment = node.get("comment")
+        if comment:
+            lines.append("- Comment: %s" % _inline_text(str(comment), 240))
+        lines.extend(_ultra_parameter_lines(node.get("parameters", [])))
+        lines.append("")
+        geometry_summary = node.get("geometry_summary")
+        if geometry_summary:
+            lines.append("### Geometry of `%s`" % node.get("path"))
+            lines.append("")
+            lines.extend(_ultra_geometry_lines(geometry_summary))
+
+    if data.get("code_blocks"):
+        lines.extend(_render_code_blocks(data.get("code_blocks", [])))
+    if data.get("errors"):
+        lines.extend(_render_errors(data.get("errors", [])))
+    lines.extend(_llm_footer_lines(data))
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def render_markdown(data: Dict[str, Any]) -> str:
     mode = data.get("options", {}).get("markdown_mode", DEFAULT_MARKDOWN_MODE)
     if mode == "compact":
         return render_compact_markdown(data)
+    if mode in ("attributes", "ultra"):  # "ultra" is the legacy name of attribute mode
+        return render_ultra_markdown(data)
 
     lines: List[str] = []
-    lines.append("# Houdini Scene Export")
+    lines.append("# Houdini Scene Export%s" % _houdini_version_suffix(data))
     lines.append("")
     lines.append("- Connection notation: `A to B` means A is connected to B.")
     lines.append("")
 
+    node_info = _compact_node_info(data.get("nodes", []))
     lines.extend(_render_node_tree(data.get("nodes", [])))
-    lines.extend(_render_connections(data.get("connections", [])))
+    lines.extend(_render_connections(data.get("connections", []), node_info))
     lines.extend(_render_code_blocks(data.get("code_blocks", [])))
     lines.extend(_render_nodes(data.get("nodes", [])))
     lines.extend(_render_hda_definitions(data.get("hda_definitions", [])))
     lines.extend(_render_errors(data.get("errors", [])))
+    lines.extend(_llm_footer_lines(data))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1835,23 +2653,31 @@ def _render_node_tree(nodes: Sequence[Dict[str, Any]]) -> List[str]:
     return lines
 
 
-def _render_connections(connections: Sequence[Dict[str, Any]]) -> List[str]:
+def _render_connections(connections: Sequence[Dict[str, Any]], node_info: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
     lines = ["## Connections", ""]
     if not connections:
         lines.append("(none)")
         lines.append("")
         return lines
+    node_info = node_info or {}
+
+    def annotate(path: Any) -> str:
+        info = node_info.get(str(path))
+        if info is None or _compact_name_matches_type(info.get("name"), info):
+            return "`%s`" % path
+        return "`%s` (%s)" % (path, info.get("type_label") or "?")
+
     for connection in connections:
         src = connection.get("source", {})
         dst = connection.get("target", {})
         src_port = src.get("output_name") or src.get("output_index")
         dst_port = dst.get("input_name") or dst.get("input_index")
         lines.append(
-            "- `%s`[%s] to `%s`[%s]"
+            "- %s[%s] to %s[%s]"
             % (
-                src.get("item") or src.get("node"),
+                annotate(src.get("item") or src.get("node")),
                 src_port,
-                dst.get("item") or dst.get("node"),
+                annotate(dst.get("item") or dst.get("node")),
                 dst_port,
             )
         )
@@ -1993,6 +2819,10 @@ def _render_parameters(parameters: Sequence[Dict[str, Any]]) -> List[str]:
         type_text = template.get("type") or template.get("class")
         value = _parameter_tuple_display_value(parm_tuple)
         rendered_value = _short_value(value)
+        if template.get("menu_items") or template.get("menu_labels"):
+            menu_label = _compact_menu_value_label(parm_tuple, _compact_parameter_scalar(parm_tuple))
+            if menu_label is not None:
+                rendered_value = "%s (menu label: `%s`)" % (rendered_value, menu_label)
         lines.append(
             "  - `%s` (%s, %s): %s"
             % (parm_tuple.get("name"), label, type_text, rendered_value)
@@ -2148,8 +2978,17 @@ def export_current_scene(
     include_standard_attributes: bool = False,
     include_bypassed_nodes: bool = DEFAULT_INCLUDE_BYPASSED_NODES,
     include_scene_paths: bool = DEFAULT_INCLUDE_SCENE_PATHS,
+    include_network_items: bool = False,
     temporary_frame: Optional[float] = None,
 ) -> Dict[str, str]:
+    if markdown_mode in ("attributes", "ultra"):
+        # Attribute mode ("ultra" is its legacy name) dumps geometry attributes:
+        # it needs cooked geometry and sample values.
+        include_geometry_summary = True
+        geometry_node_mode = "all"
+        include_standard_attributes = True
+        if geometry_sample_count == 0:
+            geometry_sample_count = DEFAULT_ULTRA_SAMPLE_COUNT
     exporter = HoudiniSceneExporter(
         root_paths=root_paths,
         node_paths=node_paths,
@@ -2169,6 +3008,7 @@ def export_current_scene(
         include_standard_attributes=include_standard_attributes,
         include_bypassed_nodes=include_bypassed_nodes,
         include_scene_paths=include_scene_paths,
+        include_network_items=include_network_items,
         temporary_frame=temporary_frame,
     )
     data = exporter.export()
@@ -2317,7 +3157,7 @@ class HoudiniSceneExportDialog:
         _set_combo_value(self.format_combo, "markdown")
         format_layout.addRow("形式", self.format_combo)
         self.markdown_mode_combo = QtWidgets.QComboBox()
-        for label, value in (("コンパクト", "compact"), ("詳細", "verbose")):
+        for label, value in (("コンパクト", "compact"), ("詳細", "verbose"), ("アトリビュート（選択ノードの属性値・cookします）", "attributes")):
             self.markdown_mode_combo.addItem(label, value)
         _set_combo_value(self.markdown_mode_combo, DEFAULT_MARKDOWN_MODE)
         format_layout.addRow("Markdown", self.markdown_mode_combo)
@@ -2334,6 +3174,9 @@ class HoudiniSceneExportDialog:
         self.include_bypassed_check = QtWidgets.QCheckBox("バイパスノードも含める")
         self.include_bypassed_check.setChecked(DEFAULT_INCLUDE_BYPASSED_NODES)
         parm_layout.addRow("", self.include_bypassed_check)
+        self.include_network_items_check = QtWidgets.QCheckBox("付箋/ネットワークボックス/ドットも記録する（既定はドットを直結扱いにして省略）")
+        self.include_network_items_check.setChecked(False)
+        parm_layout.addRow("", self.include_network_items_check)
         self.changed_only_check = QtWidgets.QCheckBox("デフォルトから変わったパラメータだけにする（状態問い合わせを行います）")
         parm_layout.addRow("", self.changed_only_check)
         self.evaluate_parameters_check = QtWidgets.QCheckBox("現在フレームのパラメータを評価する")
@@ -2488,6 +3331,7 @@ class HoudiniSceneExportDialog:
             "include_private_attributes": self.private_attrs_check.isChecked(),
             "include_standard_attributes": self.standard_attrs_check.isChecked(),
             "include_bypassed_nodes": self.include_bypassed_check.isChecked(),
+            "include_network_items": self.include_network_items_check.isChecked(),
             "include_scene_paths": self.include_scene_paths_check.isChecked(),
             "temporary_frame": self.temporary_frame_spin.value() if self.temporary_frame_check.isChecked() else None,
         }
@@ -2503,7 +3347,9 @@ class HoudiniSceneExportDialog:
             options["node_paths"] = [node.path() for node in selected]
 
         cook_sensitive_reasons = []
-        if options["include_geometry_summary"]:
+        if options["markdown_mode"] in ("attributes", "ultra"):
+            cook_sensitive_reasons.append("アトリビュートモード（属性値の取得）")
+        elif options["include_geometry_summary"]:
             cook_sensitive_reasons.append("ジオメトリ/アトリビュート取得")
         if options["changed_only"]:
             cook_sensitive_reasons.append("デフォルト差分判定")
@@ -2587,7 +3433,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selected", action="store_true", help="Export selected nodes only, without recursing into their children.")
     parser.add_argument("--out", default=None, help="Output file base/path or directory. Default: $HIP/<hip>_scene_text_<timestamp>.")
     parser.add_argument("--format", choices=("markdown", "json", "both"), default="markdown", help="Output format.")
-    parser.add_argument("--markdown-mode", choices=("compact", "verbose"), default=DEFAULT_MARKDOWN_MODE, help="Markdown detail level. compact is the default.")
+    parser.add_argument("--markdown-mode", choices=("compact", "verbose", "attributes", "ultra"), default=DEFAULT_MARKDOWN_MODE, help="Markdown detail level. compact is the default. attributes dumps geometry attribute/group values for the exported nodes (works with multiple selected nodes; forces geometry cooking). ultra is a deprecated alias for attributes.")
     parser.add_argument("--include-scene-paths", action="store_true", help="Include HIP and loaded HDA file paths. Off by default.")
     parser.add_argument("--changed-only", action="store_true", help="Only include parameters that are not at default values.")
     parser.add_argument("--evaluate-parameters", dest="evaluate_parameters", action="store_true", default=DEFAULT_EVALUATE_PARAMETERS, help="Evaluate parameter values on the current frame. On by default.")
@@ -2598,6 +3444,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-hidden-parms", action="store_true", help="Include hidden parameters. Off by default to keep exports compact.")
     parser.add_argument("--skip-hidden-parms", action="store_true", help="Deprecated compatibility option. Hidden parameters are skipped by default.")
     parser.add_argument("--include-bypassed-nodes", action="store_true", help="Include bypassed nodes. Off by default to keep exports focused on active flow.")
+    parser.add_argument("--include-network-items", action="store_true", help="Include sticky notes, network boxes and network dots as records. Off by default; dots are always collapsed into direct connections.")
     parser.add_argument("--recurse-locked", action="store_true", help="Recurse into locked HDAs. Off by default to keep exports compact.")
     parser.add_argument("--sync-delayed", action="store_true", help="Force delayed HDA contents to load. Off by default.")
     parser.add_argument("--no-recurse-locked", action="store_true", help="Deprecated compatibility option. Locked HDA recursion is off by default.")
@@ -2669,6 +3516,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             include_standard_attributes=args.include_standard_attributes,
             include_bypassed_nodes=args.include_bypassed_nodes,
             include_scene_paths=args.include_scene_paths,
+            include_network_items=args.include_network_items,
             temporary_frame=args.temporary_frame,
         )
     except Exception:
