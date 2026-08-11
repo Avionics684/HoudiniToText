@@ -30,7 +30,7 @@ Houdini 21 の現在の HIP シーンを、LLM に渡しやすい Markdown と�
 ```python
 import runpy
 
-tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py")
+tool = runpy.run_path(r"C:\Users\username\Documents\houdinitotext\houdini_scene_to_text.py")
 tool["show_export_ui"]()
 ```
 
@@ -39,49 +39,20 @@ UIが開いたら、通常はそのまま `書き出す` を押します。標�
 短い1行で起動したい場合は、起動専用ファイルを実行します。
 
 ```python
-exec(open(r"C:\Users\ponpa\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
+exec(open(r"C:\Users\username\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
 ```
 
-メインスクリプトを直接実行する方式も使えます。
 
-```python
-exec(open(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py", encoding="utf-8").read())
-```
 
 ### Shelf Tool に登録する場合
 
 Shelf に Python Tool を作り、Script 欄に同じ1行を入れます。
 
 ```python
-exec(open(r"C:\Users\ponpa\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
+exec(open(r"C:\Users\username\Documents\houdinitotext\launch_ui.py", encoding="utf-8").read())
 ```
 
-### runpy で読み込む場合
 
-同じ Houdini セッション内で関数として読み込みたい場合は、次のようにします。
-
-```python
-import runpy
-
-tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py")
-tool["show_export_ui"]()
-```
-
-### UIを使わずPythonから直接書き出す場合
-
-これはUIを出さずに、現在のシーンをそのまま書き出します。
-
-```python
-import runpy
-
-tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py")
-paths = tool["export_current_scene"](
-    output=r"C:\tmp\houdini_scene_export",
-)
-print(paths)
-```
-
-この場合、コンパクトな Markdown が作られます。
 
 - `C:\tmp\houdini_scene_export.md`
 
@@ -111,19 +82,19 @@ paths = tool["export_current_scene"](
 Houdini Command Line Tools など、`hython` が通っている環境で、HIP ファイルを指定して実行できます。
 
 ```powershell
-hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --out C:\tmp\houdini_scene_export
+hython C:\Users\username\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --out C:\tmp\houdini_scene_export
 ```
 
 選択中ノードだけを書き出す場合。選んだノードそのものだけを書き出し、子ノードには潜りません:
 
 ```powershell
-hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --selected --out C:\tmp\selected_export
+hython C:\Users\username\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --selected --out C:\tmp\selected_export
 ```
 
 特定ネットワークだけを書き出す場合:
 
 ```powershell
-hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --root /obj/geo1 --out C:\tmp\geo1_export
+hython C:\Users\username\Documents\houdinitotext\houdini_scene_to_text.py C:\path\to\scene.hip --root /obj/geo1 --out C:\tmp\geo1_export
 ```
 
 ## 重要オプション
