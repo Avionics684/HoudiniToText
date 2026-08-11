@@ -9,7 +9,11 @@ Houdini 21 の現在の HIP シーンを、LLM に渡しやすい Markdown と�
 - ノードの親子構造、タイプ、カテゴリ、フラグ、コメント、ユーザーデータを記録
 - 何が何に接続されているかを、入力/出力ポート名・番号つきで記録
 - 全パラメータの種類、ラベル、テンプレート情報、値、式、キーフレーム、メニュー項目などを記録
+- パラメータに式がある場合は、現在フレームの評価結果より式そのものを優先して表示（コンパクトを含む全モード）
+- 数値チャンネルの各キーフレーム式（`$F`、`ch()`、`bezier()` 等）と式言語、文字列の `$HIP` / `$F` / バッククォート、チャンネル参照先、チャンネルエイリアス、CHOP 上書きを記録（JSON／詳細版は全キー、コンパクト版は重複しない意味のあるキー）
+- APEX/KineFX のパック済みキャラクターは、Rig Tree の Packed Folders に相当する階層を記録
 - Wrangle の `snippet`、Python SOP、Callback、VEX/VOP/HScript らしき文字列をコードブロックとして抽出
+- 通常パラメータの `ch()` 式、グループ式、HDA の callback タグはコード欄へ重複掲載せず、対応するパラメータ／チャンネル情報としてのみ記録
 - VOP ネットワーク、サブネット、TOP、ROP も子ノードと接続としてそのままテキスト化
 - 明示指定した場合だけ HDA の PythonModule / VEX / DialogScript などのセクションも記録
 - 明示指定した場合だけ SOP ジオメトリを cook し、primitive / detail(global) アトリビュートを優先して記録
@@ -30,7 +34,7 @@ tool = runpy.run_path(r"C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_
 tool["show_export_ui"]()
 ```
 
-UIが開いたら、通常はそのまま `書き出す` を押します。標準設定では現在フレーム1枚だけパラメータを評価し、SOP/DOP のジオメトリ取得やノード状態問い合わせは行いません。形式や HDA、アトリビュートなどの追加設定は `詳細設定` の中に畳んであります。
+UIが開いたら、通常はそのまま `書き出す` を押します。標準設定では現在フレーム1枚だけパラメータを評価し、通常の SOP/DOP アトリビュート取得やノード状態問い合わせは行いません。パック済みリグの候補 SOP だけは、Rig Tree 階層を確認するため cook される場合があります。形式や HDA、アトリビュートなどの追加設定は `詳細設定` の中に畳んであります。
 
 短い1行で起動したい場合は、起動専用ファイルを実行します。
 
@@ -81,7 +85,7 @@ print(paths)
 
 - `C:\tmp\houdini_scene_export.md`
 
-標準設定では現在フレーム1枚だけパラメータを評価します。SOP ジオメトリ取得、DOP/SOP/TOP/ROP の状態問い合わせ、アトリビュート取得は行いません。
+標準設定では現在フレーム1枚だけパラメータを評価します。通常の SOP ジオメトリアトリビュート取得、DOP/SOP/TOP/ROP の状態問い合わせは行いません。パック済みリグの候補 SOP だけは Rig Tree 階層の確認対象です。
 
 アトリビュート情報が必要なときだけ `include_geometry_summary=True` を指定してください。この場合、対象 SOP が cook される可能性があります。
 
@@ -128,15 +132,21 @@ hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\t
   - 既定値。Markdown だけを書き出します。JSON も必要なら `--format both` を使います。
 - `--include-scene-paths`
   - HIP ファイルパスやロード済み HDA ファイルパスも含めます。既定では出しません。
+- `--markdown-mode smart`
+  - 「スマートモード（実験的）」です。RBD に限らず、Houdini の各ノードで現在の Parameter Pane に見えている項目を対象にします。Wrangle などのコード中心ノードは、VEX を読みやすく保つ専用のコンパクト表示を継続します。
+  - 内部パラメーター名ではなく実際の UI ラベルとフォルダ名を使い、メニューの `0` / `1` / `2` などは `None` / `Ground Plane` / `Height Field` のような表示名へ変換します。式をユーザーが設定した項目は、現在の評価値と式の原文を両方出します。HDA 定義にもともと入っている既定の内部リンク式は省きます。
+  - 全ノードの変更された有効設定を出し、RBDやソルバーなどの重要ノードでは Parameter Pane 上部の主要な既定設定も少量補います。現在の UI で隠れている内部項目と無効な既定項目は省きます。このモードでは UI 状態を正しく判定するため `--include-parameter-state` 相当が自動的に有効になります。旧名 `--markdown-mode rbd_smart` も互換用エイリアスとして使用できます。
+  - 参照した公式仕様: [hou.Parm](https://www.sidefx.com/docs/houdini/hom/hou/Parm.html)、[hou.OpNode.updateParmStates](https://www.sidefx.com/docs/houdini/hom/hou/OpNode.html)、[RBD Bullet Solver](https://www.sidefx.com/docs/houdini/nodes/sop/rbdbulletsolver.html)、[RBD Material Fracture](https://www.sidefx.com/docs/houdini/nodes/sop/rbdmaterialfracture-.html)。
 - `--markdown-mode compact`
-  - 既定値。HIP ファイルパスや重複しやすい Node Graph の全ツリーは省き、接続、各ノードの見えるインスペクタ設定、コードを短くまとめます。Wrangle は VEX と Run Over を優先し、autobind/export/vex_* 系の細かい内部設定は出しません。ノードの所属階層は `/obj/geo1/...` のようなパスから読めます。`0` や空文字の値も含め、現在フレームで評価できた値を優先して書きます。パラメータがないノードは `Params` 行を出しません。インスペクタ設定は 1 ノード最大 24 項目まで出し、超過分は件数だけ表示します。従来の詳細版が必要なら `--markdown-mode verbose`。
+  - 既定値。HIP ファイルパスや重複しやすい Node Graph の全ツリーは省き、接続、各ノードの見えるインスペクタ設定、コードを短くまとめます。Wrangle は VEX と Run Over を優先し、autobind/export/vex_* 系の細かい内部設定は出しません。共通のノードパスは `Path base` として一度だけ書き、各見出しはそこからの正確な相対パスで表します。パラメータに式があれば ``expression=`ch(...)` `` のように式を最優先し、式がない場合は `0` や空文字を含む現在フレームの評価値を書きます。通常の式を保存するためだけの「単一F1キー」は `Params` と重複するため再掲せず、複数キー、F1以外のキー、補間キー、チャンネル参照先、CHOP 上書きは個別に表示します。パラメータがないノードは `Params` 行を出しません。インスペクタ設定は 1 ノード最大 24 項目まで出し、超過分は件数だけ表示します。省略分は不明として扱い、デフォルト値とはみなしません。従来の詳細版が必要なら `--markdown-mode verbose`。
   - 接続はネットワーク（親ノード）ごとにまとめ、ノードは相対名で書きます。第1入力への直列接続は `grid1 -> subdivide1 -> COPY` のようにチェーン表記へ圧縮し、それ以外のポートは `[output2]` / `[input3: Constraint Geometry]` のようにポート名とラベルで明示します。
   - ワイヤー中継用のドット（丸い中継点）は透過して、ノード同士の直接接続として書きます（出力ポート番号もドット越しに保持。JSON では `via_dots` に経由したドットを記録）。
   - どこにも接続されていないノードは `Not wired:` 行に列挙します。
   - フォルダの開閉状態パラメータ（`folder3` 等）や、ランプの各ポイントのバラバラな内部パラメータは省き、ランプは `ramp (0, 1) (1, 1) @ Catmull-Rom` の1行に要約します。
+  - 長大な16進列・エンコード済みストロークデータなどは本文を展開せず、文字数と SHA-256 に要約します。JSON 側の元データは維持します。
   - Inspector Settings のノード順は重要度ベースです。LLM は長文の先頭と末尾への注意力が高いため、ソルバー・Wrangle・フラクチャ等の重要ノードを最初と最後に、box / merge / transform 等の脇役を中央に配置します。
   - ソルバー等の重要ノードは、全パラメータがデフォルトでも `- Defaults:` 行として先頭側の主要パラメータを最大10個表示します（Houdini の UI は重要な設定ほど上に並ぶため、汎用的にどのノードタイプでも機能します）。
-  - 末尾に LLM 向けの短い日本語の指示文（このダンプを根拠に、不確かな仕様は SideFX の最新公式ドキュメントを調べ、正確な Houdini 知識で答える等）を自動で付けます。全モード共通です。
+  - 末尾に LLM 向けの短い日本語の指示文（このダンプを根拠に、不確かな仕様は SideFX の最新公式ドキュメントを調べ、正確な Houdini 知識で答える等）と「ファイルキャッシュなどは毎回きちんと更新しています。」という注意書きを自動で付けます。全モード共通です。
   - ユーザーがリネームしたノード（名前からタイプが読めないノード）には `` `COPY` (Copy to Points) `` のようにノードタイプのラベルを併記します。
   - デフォルト値のままのパラメータは省略し、ユーザーが変更した値だけを出します（JSON には全パラメータが残ります）。
   - プルダウン（メニュー）パラメータは `2` のような内部インデックスではなく、UI に見えているメニューラベルで書きます。
@@ -189,6 +199,8 @@ hython C:\Users\ponpa\Documents\houdinitotext\houdini_scene_to_text.py C:\path\t
   - `P`, `N`, `uv`, `Cd`, `v`, `pscale` などの定番 point/vertex 属性も含めます。既定では省略します。
 - `--include-private-attributes`
   - private 属性も含めます。既定では省略します。
+- `--include-packed-rig-trees` / `--skip-packed-rig-trees`
+  - 既定ではパック生成系の SOP だけからパック済みキャラクターのフォルダ階層を取得し、コンパクト／詳細／アトリビュート Markdown と JSON に出します。Rig Tree の `Packed Folders` 表示に相当します。アトリビュート取得を有効にした場合は、すでに cook 対象になっているジオメトリも確認します。通常の選択ノードをリグツリー確認だけのために cook することはありません。不要なら `--skip-packed-rig-trees` で無効化できます。
 
 ## LLM に渡すなら
 
