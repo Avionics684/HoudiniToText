@@ -22,7 +22,7 @@ except ImportError:  # Allows syntax checks outside Houdini.
     hou = None  # type: ignore
 
 
-SCHEMA_VERSION = "1.11.1"
+SCHEMA_VERSION = "1.17.3"
 EXPORTER_NAME = "houdini_scene_to_text"
 DEFAULT_MAX_TEXT_CHARS = 200_000
 DEFAULT_GEOMETRY_SAMPLE_COUNT = 0
@@ -30,8 +30,10 @@ DEFAULT_GEOMETRY_NODE_MODE = "important"
 DEFAULT_MARKDOWN_MODE = "compact"
 DEFAULT_COMPACT_PARAMETER_LIMIT = 24
 DEFAULT_EVALUATE_PARAMETERS = True
+DEFAULT_INCLUDE_PACKED_RIG_TREES = True
 DEFAULT_INCLUDE_BYPASSED_NODES = False
 DEFAULT_INCLUDE_SCENE_PATHS = False
+EXPORT_FRESHNESS_NOTICE_JA = "ファイルキャッシュなどは毎回きちんと更新しています。"
 PARAMETER_SILENT_NODE_TYPES = {"null", "merge"}
 WRANGLE_RUN_OVER_BY_INDEX = {
     0: "Detail (only once)",
@@ -73,29 +75,47 @@ CODE_NAME_HINTS = (
     "code",
     "script",
     "python",
-    "vex",
     "vfl",
     "osl",
-    "source",
-    "shader",
     "callback",
     "kernel",
-    "wrangle",
 )
 
 CODE_TEXT_HINTS = (
-    "\n",
     ";\n",
-    "{",
-    "}",
-    "@",
     "def ",
     "class ",
     "import ",
     "return ",
     "#include",
-    "ch(",
     "hou.",
+)
+
+
+def _text_looks_like_code(text: str) -> bool:
+    """Recognize executable source without mistaking group/path expressions for code."""
+    if any(hint in text for hint in CODE_TEXT_HINTS):
+        return True
+    if re.search(r"(?m)^\s*(?:from\s+\S+\s+import|if\b.*:|for\b.*:|while\b.*:|try\s*:|with\b.*:)\s*$", text):
+        return True
+    # VEX snippets commonly contain attribute writes and a semicolon. A group
+    # pattern such as @name=piece is not executable code and has no semicolon.
+    if ";" in text and re.search(r"@[A-Za-z_]\w*\s*(?:\[[^]]+\])?\s*(?:=|\+=|-=|\*=|/=)", text):
+        return True
+    if ";" in text and "{" in text and "}" in text:
+        return True
+    return False
+
+PACKED_RIG_NODE_TYPE_HINTS = (
+    "packfolder",
+    "packedfoldersplit",
+    "unpackfolder",
+    "packcharacter",
+    "characterpack",
+    "characterio",
+    "sceneaddcharacter",
+    "sceneanimate",
+    "testgeometry_crag",
 )
 
 
@@ -239,6 +259,90 @@ def _as_plain(value: Any, max_text_chars: int = DEFAULT_MAX_TEXT_CHARS) -> Any:
         return repr(value)
 
 
+_NUMERIC_LITERAL_RE = re.compile(
+    r"^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$"
+)
+
+
+def _is_trivial_expression_source(source: Any) -> bool:
+    """Return True for literals that convey no more information than their value."""
+    return isinstance(source, str) and bool(_NUMERIC_LITERAL_RE.fullmatch(source.strip()))
+
+
+def _parm_record_expression_source(parm_record: Dict[str, Any]) -> Any:
+    """Return unevaluated parameter text when it represents an expression/source."""
+    source_text = parm_record.get("source_text")
+    if source_text not in (None, "") and not _is_trivial_expression_source(source_text):
+        return source_text
+
+    expression = parm_record.get("expression")
+    if expression not in (None, "") and not _is_trivial_expression_source(expression):
+        return expression
+
+    raw_value = parm_record.get("raw_value")
+    if (
+        parm_record.get("is_showing_expression")
+        and raw_value not in (None, "")
+        and not _is_trivial_expression_source(raw_value)
+    ):
+        return raw_value
+
+    keyframes = parm_record.get("keyframes", []) or []
+    if any(keyframe.get("expression") not in (None, "") for keyframe in keyframes):
+        keyframe_expressions = [
+            keyframe.get("expression")
+            for keyframe in keyframes
+            if keyframe.get("expression") not in (None, "")
+            and not _is_trivial_expression_source(keyframe.get("expression"))
+        ]
+        if not keyframe_expressions:
+            return None
+        # rawValue() normally returns the active key's source, but do not let a
+        # UI/evaluation-state numeric value replace the source found directly
+        # on the keyframes.
+        if raw_value in keyframe_expressions:
+            return raw_value
+        return keyframe_expressions[0]
+
+    # String parameters can contain $ variables and backtick expressions
+    # without owning an animation channel/keyframe.
+    unexpanded = parm_record.get("unexpanded_string")
+    if isinstance(unexpanded, str) and ("$" in unexpanded or "`" in unexpanded):
+        return unexpanded
+    return None
+
+
+_CHANNEL_REFERENCE_RE = re.compile(
+    r"\b(?:ch|chf|chi|chramp|chs|chsop|chv|chp|chop)\s*\(",
+    re.IGNORECASE,
+)
+_KEYFRAME_INTERPOLATION_RE = re.compile(
+    r"^\s*(?:bezier|constant|cubic|cycle|cycleoffset|linear|match|qlinear|spline|vmatch)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _expression_source_kind(source: Any, language: Any = None) -> Optional[str]:
+    """Classify source for readability without restricting what is captured."""
+    if source in (None, "") or _is_trivial_expression_source(source):
+        return None
+    text = str(source)
+    language_text = str(language or "").lower()
+    if _KEYFRAME_INTERPOLATION_RE.search(text):
+        return "keyframe_interpolation"
+    if _CHANNEL_REFERENCE_RE.search(text):
+        return "channel_reference"
+    if "`" in text:
+        return "string_backtick_expression"
+    if "$" in text:
+        return "hscript_variable"
+    if "python" in language_text:
+        return "python_expression"
+    if "hscript" in language_text:
+        return "hscript_expression"
+    return "expression"
+
+
 def _truncate_text(text: str, max_text_chars: int = DEFAULT_MAX_TEXT_CHARS) -> str:
     if max_text_chars is None or max_text_chars <= 0 or len(text) <= max_text_chars:
         return text
@@ -309,6 +413,7 @@ class HoudiniSceneExporter:
         geometry_node_mode: str = DEFAULT_GEOMETRY_NODE_MODE,
         include_private_attributes: bool = False,
         include_standard_attributes: bool = False,
+        include_packed_rig_trees: bool = DEFAULT_INCLUDE_PACKED_RIG_TREES,
         include_bypassed_nodes: bool = DEFAULT_INCLUDE_BYPASSED_NODES,
         include_scene_paths: bool = DEFAULT_INCLUDE_SCENE_PATHS,
         include_network_items: bool = False,
@@ -330,6 +435,7 @@ class HoudiniSceneExporter:
         self.geometry_node_mode = geometry_node_mode
         self.include_private_attributes = include_private_attributes
         self.include_standard_attributes = include_standard_attributes
+        self.include_packed_rig_trees = include_packed_rig_trees
         self.include_bypassed_nodes = include_bypassed_nodes
         self.include_scene_paths = include_scene_paths
         self.include_network_items = include_network_items
@@ -338,6 +444,7 @@ class HoudiniSceneExporter:
         self._connection_keys: set = set()
         self._definition_keys: set = set()
         self._hda_definitions: List[Dict[str, Any]] = []
+        self._geometry_cache: Dict[str, Any] = {}
 
     def export(self) -> Dict[str, Any]:
         if hou is None:
@@ -427,6 +534,7 @@ class HoudiniSceneExporter:
                 "geometry_node_mode": self.geometry_node_mode,
                 "include_private_attributes": self.include_private_attributes,
                 "include_standard_attributes": self.include_standard_attributes,
+                "include_packed_rig_trees": self.include_packed_rig_trees,
                 "include_bypassed_nodes": self.include_bypassed_nodes,
                 "include_scene_paths": self.include_scene_paths,
                 "include_network_items": self.include_network_items,
@@ -440,6 +548,7 @@ class HoudiniSceneExporter:
                 "network_dots_collapsed": len(dot_paths),
                 "code_blocks": len(code_blocks),
                 "hda_definitions": len(self._hda_definitions),
+                "packed_rig_trees": sum(1 for record in node_records if record.get("packed_rig_tree")),
                 "bypassed_nodes_skipped": len(skipped_bypassed_paths),
                 "errors": len(self.errors),
             },
@@ -449,6 +558,7 @@ class HoudiniSceneExporter:
             "network_items": network_item_records,
             "code_blocks": code_blocks,
             "hda_definitions": self._hda_definitions,
+            "notes": [EXPORT_FRESHNESS_NOTICE_JA],
             "errors": self.errors,
         }
         return data
@@ -895,6 +1005,7 @@ class HoudiniSceneExporter:
     def _node_record(self, node: Any) -> Dict[str, Any]:
         path = _path_of(node)
         node_type = self._node_type_record(node)
+        flags = self._node_flags(node)
         if _node_type_record_suppresses_parameters(node_type):
             parm_records: List[Dict[str, Any]] = []
             code_blocks: List[Dict[str, Any]] = []
@@ -914,7 +1025,7 @@ class HoudiniSceneExporter:
             "size": _as_plain(self._safe_method(node, "size", None), self.max_text_chars),
             "color": _as_plain(self._safe_method(node, "color", None), self.max_text_chars),
             "comment": _as_plain(self._safe_method(node, "comment", ""), self.max_text_chars),
-            "flags": self._node_flags(node),
+            "flags": flags,
             "user_data": _as_plain(self._safe_method(node, "userDataDict", {}), self.max_text_chars),
             "cached_user_data": _as_plain(self._safe_method(node, "cachedUserDataDict", {}), self.max_text_chars),
             "input_ports": self._ports_record(node, "input"),
@@ -936,7 +1047,115 @@ class HoudiniSceneExporter:
             geometry = self._geometry_summary(node)
             if geometry is not None:
                 record["geometry_summary"] = geometry
+        if self._should_include_packed_rig_tree(node, node_type, flags):
+            packed_rig_tree = self._packed_rig_tree(node)
+            if packed_rig_tree is not None:
+                record["packed_rig_tree"] = packed_rig_tree
         return record
+
+    def _node_geometry(self, node: Any) -> Any:
+        path = _path_of(node) or "<node:%s>" % id(node)
+        if path in self._geometry_cache:
+            return self._geometry_cache[path]
+        geometry_method = _method(node, "geometry")
+        if geometry_method is None:
+            self._geometry_cache[path] = None
+            return None
+        geometry = self._safe("%s.geometry" % path, lambda: geometry_method(), None)
+        self._geometry_cache[path] = geometry
+        return geometry
+
+    def _should_include_packed_rig_tree(
+        self,
+        node: Any,
+        node_type: Dict[str, Any],
+        flags: Dict[str, Any],
+    ) -> bool:
+        if not self.include_packed_rig_trees or _method(node, "geometry") is None:
+            return False
+        # Geometry-summary modes have already opted into cooking this node, so
+        # checking packed paths adds no extra cook. In normal compact/verbose
+        # mode, only known packed-character producers are queried.
+        if self._should_include_geometry(node):
+            return True
+        # The displayed/rendered SOP is normally already cooked by Houdini.
+        # Querying it catches packed hierarchies produced by ordinary SOPs,
+        # including Test Geometry: Crag, without probing every node upstream.
+        if flags.get("isDisplayFlagSet") is True or flags.get("isRenderFlagSet") is True:
+            return True
+        type_text = " ".join(
+            str(node_type.get(key) or "").lower()
+            for key in ("name", "name_with_category", "description")
+        )
+        return any(hint in type_text for hint in PACKED_RIG_NODE_TYPE_HINTS)
+
+    def _packed_rig_tree(self, node: Any) -> Optional[Dict[str, Any]]:
+        geometry = self._node_geometry(node)
+        if geometry is None:
+            return None
+        extract_paths = _method(geometry, "extractPackedPaths")
+        if extract_paths is None:
+            return None
+        try:
+            raw_paths = extract_paths("*")
+        except Exception:
+            return None
+        paths = sorted(
+            normalized
+            for normalized in {
+                self._normalize_packed_path(path)
+                for path in raw_paths or ()
+                if str(path or "").strip()
+            }
+            if normalized != "/"
+        )
+        if not paths:
+            return None
+
+        folders: set = set()
+        for path in paths:
+            components = [part for part in path.strip("/").split("/") if part]
+            for index in range(1, len(components)):
+                folders.add("/" + "/".join(components[:index]))
+            if components and components[-1].lower().endswith((".char", ".ctrl")):
+                folders.add(path)
+
+        properties: Dict[str, Any] = {}
+        properties_method = _method(geometry, "packedFolderProperties")
+        if properties_method is not None:
+            for path in sorted(set(paths) | folders):
+                try:
+                    value = properties_method(path)
+                except Exception:
+                    continue
+                if value:
+                    plain_value = _as_plain(value, self.max_text_chars)
+                    properties[path] = plain_value
+                    if self._packed_properties_mark_folder(plain_value):
+                        folders.add(path)
+
+        return {
+            "source": "hou.Geometry.extractPackedPaths('*')",
+            "paths": paths,
+            "folders": sorted(folders),
+            "properties": properties,
+        }
+
+    def _normalize_packed_path(self, value: Any) -> str:
+        text = str(value).replace("\\", "/").strip()
+        if not text.startswith("/"):
+            text = "/" + text
+        text = re.sub(r"/+", "/", text)
+        return text.rstrip("/") or "/"
+
+    def _packed_properties_mark_folder(self, value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for key, item in value.items():
+            normalized_key = re.sub(r"[^a-z]", "", str(key).lower())
+            if normalized_key in ("folder", "isfolder", "treatasfolder"):
+                return bool(item)
+        return False
 
     def _should_include_geometry(self, node: Any) -> bool:
         if not self.include_geometry_summary or self.geometry_node_mode == "none":
@@ -1092,6 +1311,11 @@ class HoudiniSceneExporter:
     def _node_parameters(self, node: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         records = []
         code_blocks = []
+        if self.include_parameter_state:
+            # Houdini evaluates Hide When / Disable When rules when a Parameter
+            # Pane loads a node. Explicitly refresh them so headless exports and
+            # nodes not currently shown in a pane match the real UI.
+            self._safe_method(node, "updateParmStates", None)
         parm_tuples = self._safe_method(node, "parmTuples", ())
         for parm_tuple in parm_tuples or ():
             template = self._safe_method(parm_tuple, "parmTemplate", None)
@@ -1107,30 +1331,62 @@ class HoudiniSceneExporter:
         return records, code_blocks
 
     def _parm_tuple_record(self, node: Any, parm_tuple: Any, template: Any) -> Dict[str, Any]:
-        parms = list(self._safe_method(parm_tuple, "parms", ()) or ())
+        # hou.ParmTuple is itself a sequence of hou.Parm components; it has no
+        # parms() method. Iterating the tuple is what exposes value1v1, value1v2,
+        # etc. and therefore their individual expressions/raw values.
+        parms = self._safe(
+            "%s.components" % (_path_of(parm_tuple) or "<parm_tuple>"),
+            lambda: list(parm_tuple),
+            [],
+        )
         parm_records = [self._parm_record(parm, template) for parm in parms]
         raw_values = self._parm_tuple_raw_values(parm_records)
         values = raw_values
         values_source = "raw_input"
+        evaluated_captured = False
         if self.evaluate_parameters:
             evaluated_values = _as_plain(self._safe_method(parm_tuple, "eval", None), self.max_text_chars)
             if evaluated_values is not None:
                 values = evaluated_values
                 values_source = "evaluated"
+                evaluated_captured = True
+                if len(parm_records) == 1:
+                    if isinstance(evaluated_values, (list, tuple)) and len(evaluated_values) == 1:
+                        component_values = [evaluated_values[0]]
+                    else:
+                        component_values = [evaluated_values]
+                elif isinstance(evaluated_values, (list, tuple)):
+                    component_values = list(evaluated_values)
+                else:
+                    component_values = []
+                for index, parm_record in enumerate(parm_records):
+                    if index < len(component_values):
+                        parm_record["evaluated_value"] = component_values[index]
+                        parm_record["value_evaluated"] = True
+        visible_states = [parm_record.get("is_visible") for parm_record in parm_records]
+        disabled_states = [parm_record.get("is_disabled") for parm_record in parm_records]
         return {
             "name": self._safe_method(parm_tuple, "name", None),
             "label": self._safe_method(parm_tuple, "description", None),
             "path": self._safe_method(parm_tuple, "path", None),
             "folders": self._parm_tuple_folders(parms),
             "template": self._parm_template_record(template),
-            "is_at_default": self._try_method(parm_tuple, "isAtDefault", None)
+            "is_at_default": self._parm_tuple_is_at_default(parm_tuple)
             if (self.evaluate_parameters or self.include_parameter_state or self.changed_only)
             else None,
             "is_time_dependent": self._safe_method(parm_tuple, "isTimeDependent", None) if self.include_parameter_state else None,
             "state_evaluated": self.include_parameter_state,
             "values": values,
+            "raw_values": raw_values,
             "values_source": values_source,
-            "values_evaluated": self.evaluate_parameters,
+            "values_evaluated": evaluated_captured,
+            "has_expression": any(_parm_record_expression_source(parm_record) is not None for parm_record in parm_records),
+            "ui_visible": any(state is True for state in visible_states)
+            if any(state is not None for state in visible_states)
+            else None,
+            "ui_disabled": all(state is True for state in disabled_states)
+            if any(state is not None for state in disabled_states)
+            else None,
             "parms": parm_records,
         }
 
@@ -1154,46 +1410,176 @@ class HoudiniSceneExporter:
         return None
 
     def _parm_record(self, parm: Any, template: Any) -> Dict[str, Any]:
+        capture_live_menu = self.include_parameter_state and self._template_has_dynamic_choice_menu(template)
         keyframes = self._safe_method(parm, "keyframes", ())
+        keyframe_records = [self._keyframe_record(keyframe) for keyframe in keyframes or ()]
+        raw_value = _as_plain(self._try_method(parm, "rawValue", None), self.max_text_chars)
+        unexpanded_string = _as_plain(self._try_method(parm, "unexpandedString", None), self.max_text_chars)
+        is_showing_expression = self._try_method(parm, "isShowingExpression", None)
+        keyframe_expressions = [
+            str(keyframe.get("expression"))
+            for keyframe in keyframe_records
+            if keyframe.get("expression") not in (None, "")
+        ]
+        meaningful_keyframe_expressions = [
+            source for source in keyframe_expressions if not _is_trivial_expression_source(source)
+        ]
+        expression = _as_plain(self._try_method(parm, "expression", None), self.max_text_chars)
+        if expression in (None, ""):
+            # Numeric parameter expressions are stored as channel keyframes.  On
+            # some parameter kinds/versions parm.expression() is unavailable,
+            # while the keyframe still exposes the exact source expression.
+            if meaningful_keyframe_expressions:
+                # Prefer the text read from the keyframe itself. A numeric UI
+                # display/evaluation value must never replace it.
+                expression = (
+                    raw_value
+                    if raw_value in meaningful_keyframe_expressions
+                    else meaningful_keyframe_expressions[0]
+                )
+            elif is_showing_expression and raw_value not in (None, ""):
+                expression = raw_value
+
+        keyframe_languages = list(
+            dict.fromkeys(
+                language
+                for language in (keyframe.get("expression_language") for keyframe in keyframe_records)
+                if language not in (None, "")
+            )
+        )
+        expression_language = _enum_to_string(self._try_method(parm, "expressionLanguage", None))
+        if expression_language is None and len(keyframe_languages) == 1:
+            expression_language = keyframe_languages[0]
+
+        source_text = expression if not _is_trivial_expression_source(expression) else None
+        if (
+            source_text in (None, "")
+            and is_showing_expression
+            and raw_value not in (None, "")
+            and not _is_trivial_expression_source(raw_value)
+        ):
+            source_text = raw_value
+        if (
+            source_text in (None, "")
+            and isinstance(unexpanded_string, str)
+            and ("$" in unexpanded_string or "`" in unexpanded_string)
+        ):
+            source_text = unexpanded_string
+
+        parm_path = _path_of(parm)
+        referenced_parm = self._try_method(parm, "getReferencedParm", None)
+        referenced_parm_path = _path_of(referenced_parm)
+        if referenced_parm_path == parm_path:
+            referenced_parm_path = None
+
+        chop_override = None
+        override_track = self._try_method(parm, "overrideTrack", None)
+        if override_track is not None:
+            chop_node = self._try_method(override_track, "chopNode", None)
+            active = self._try_method(parm, "isOverrideTrackActive", None)
+            if active is None:
+                active = self._try_method(override_track, "isOverrideActive", None)
+            override_parm = self._try_method(override_track, "overrideParm", None)
+            chop_override = {
+                "track_name": self._try_method(override_track, "name", None),
+                "chop_node": _path_of(chop_node),
+                "active": active,
+                "override_parm": _path_of(override_parm),
+                "num_samples": self._try_method(override_track, "numSamples", None),
+            }
+            chop_override = {key: value for key, value in chop_override.items() if value is not None}
+
         record = {
             "name": self._safe_method(parm, "name", None),
-            "path": self._safe_method(parm, "path", None),
+            "path": parm_path,
             "component_index": self._safe_method(parm, "componentIndex", None),
-            "raw_value": _as_plain(self._try_method(parm, "rawValue", None), self.max_text_chars),
-            "unexpanded_string": _as_plain(self._try_method(parm, "unexpandedString", None), self.max_text_chars),
-            "evaluated_value": _as_plain(self._try_method(parm, "eval", None), self.max_text_chars) if self.evaluate_parameters else None,
-            "value_evaluated": self.evaluate_parameters,
-            "expression": _as_plain(self._try_method(parm, "expression", None), self.max_text_chars),
-            "expression_language": _enum_to_string(self._try_method(parm, "expressionLanguage", None)),
-            "is_at_default": self._try_method(parm, "isAtDefault", None) if self.include_parameter_state else None,
+            "alias": self._try_method(parm, "alias", None),
+            "raw_value": raw_value,
+            "unexpanded_string": unexpanded_string,
+            "evaluated_value": None,
+            "value_evaluated": False,
+            "expression": expression,
+            "expressions": list(dict.fromkeys(keyframe_expressions)) if keyframe_records else ([expression] if expression not in (None, "") else []),
+            "expression_language": expression_language,
+            "expression_languages": keyframe_languages or ([expression_language] if expression_language else []),
+            "expression_kind": _expression_source_kind(source_text, expression_language),
+            "source_text": source_text,
+            "referenced_parm": referenced_parm_path,
+            "chop_override": chop_override,
+            "is_showing_expression": is_showing_expression,
+            "is_at_default": self._try_method(parm, "isAtDefault", None, True, True) if self.include_parameter_state else None,
             "is_disabled": self._try_method(parm, "isDisabled", None) if self.include_parameter_state else None,
             "is_hidden": self._try_method(parm, "isHidden", None) if self.include_parameter_state else None,
+            "is_visible": self._try_method(parm, "isVisible", None) if self.include_parameter_state else None,
             "is_locked": self._try_method(parm, "isLocked", None) if self.include_parameter_state else None,
+            "is_spare": self._try_method(parm, "isSpare", None) if self.include_parameter_state else None,
+            "is_dynamic_menu": self._try_method(parm, "isDynamicMenu", None) if capture_live_menu else None,
+            "menu_items": _as_plain(self._try_method(parm, "menuItems", None), self.max_text_chars)
+            if capture_live_menu
+            else None,
+            "menu_labels": _as_plain(self._try_method(parm, "menuLabels", None), self.max_text_chars)
+            if capture_live_menu
+            else None,
             "is_time_dependent": self._try_method(parm, "isTimeDependent", None) if self.include_parameter_state else None,
             "state_evaluated": self.include_parameter_state,
             "is_multi_parm_instance": self._try_method(parm, "isMultiParmInstance", None),
             "multi_parm_indices": _as_plain(self._try_method(parm, "multiParmInstanceIndices", None), self.max_text_chars),
             "containing_folders": _as_plain(self._try_method(parm, "containingFolders", ()), self.max_text_chars),
-            "keyframes": [self._keyframe_record(keyframe) for keyframe in keyframes or ()],
+            "keyframes": keyframe_records,
         }
         parent_multi = self._try_method(parm, "parentMultiParm", None)
         if parent_multi is not None:
             record["parent_multi_parm"] = self._try_method(parent_multi, "path", None)
         return record
 
+    def _template_has_dynamic_choice_menu(self, template: Any) -> bool:
+        """Avoid running expensive attribute/preset helper menus as choices."""
+        if template is None:
+            return False
+        template_class = template.__class__.__name__
+        if template_class == "StringParmTemplate":
+            menu_type = str(_enum_to_string(self._try_method(template, "menuType", None)) or "").lower()
+            if "stringtoggle" in menu_type or "stringreplace" in menu_type:
+                return False
+        if template_class not in ("MenuParmTemplate", "IntParmTemplate", "StringParmTemplate"):
+            return False
+        return bool(self._try_method(template, "itemGeneratorScript", ""))
+
     def _keyframe_record(self, keyframe: Any) -> Dict[str, Any]:
-        return {
+        json_data = _as_plain(
+            self._try_method(keyframe, "asJSON", None, False, True),
+            self.max_text_chars,
+        )
+        expression = _as_plain(self._try_method(keyframe, "expression", None), self.max_text_chars)
+        expression_language = _enum_to_string(self._try_method(keyframe, "expressionLanguage", None))
+        if isinstance(json_data, dict):
+            if expression in (None, ""):
+                expression = json_data.get("expression") or json_data.get("expr")
+            if expression_language is None:
+                expression_language = _enum_to_string(
+                    json_data.get("expression_language") or json_data.get("language")
+                )
+        record = {
             "class": keyframe.__class__.__name__,
             "frame": self._try_method(keyframe, "frame", None),
             "time": self._try_method(keyframe, "time", None),
             "value": _as_plain(self._try_method(keyframe, "value", None), self.max_text_chars),
-            "expression": _as_plain(self._try_method(keyframe, "expression", None), self.max_text_chars),
-            "expression_language": _enum_to_string(self._try_method(keyframe, "expressionLanguage", None)),
+            "expression": expression,
+            "expression_language": expression_language,
+            "expression_kind": _expression_source_kind(expression, expression_language),
+            "is_expression_set": self._try_method(keyframe, "isExpressionSet", None),
+            "is_expression_language_set": self._try_method(keyframe, "isExpressionLanguageSet", None),
             "slope": _as_plain(self._try_method(keyframe, "slope", None), self.max_text_chars),
             "accel": _as_plain(self._try_method(keyframe, "accel", None), self.max_text_chars),
             "in_slope": _as_plain(self._try_method(keyframe, "inSlope", None), self.max_text_chars),
             "out_slope": _as_plain(self._try_method(keyframe, "outSlope", None), self.max_text_chars),
         }
+        if json_data is not None:
+            # Preserve Houdini's complete keyframe serialization too. This
+            # carries key-type-specific fields that differ between numeric,
+            # string, and future keyframe classes.
+            record["data"] = json_data
+        return record
 
     def _parm_template_record(self, template: Any) -> Dict[str, Any]:
         if template is None:
@@ -1226,6 +1612,14 @@ class HoudiniSceneExporter:
             "is_hidden": self._try_method(template, "isHidden", None),
             "is_disabled": self._try_method(template, "isDisabled", None),
             "join_with_next": self._try_method(template, "joinsWithNext", None),
+            "is_label_hidden": self._try_method(template, "isLabelHidden", None),
+            "look": _enum_to_string(self._try_method(template, "look", None)),
+            "default_value": _as_plain(self._try_method(template, "defaultValue", None), self.max_text_chars),
+            "default_expression": _as_plain(self._try_method(template, "defaultExpression", None), self.max_text_chars),
+            "default_expression_language": _as_plain(
+                self._try_method(template, "defaultExpressionLanguage", None),
+                self.max_text_chars,
+            ),
         }
         return {key: value for key, value in fields.items() if value is not None}
 
@@ -1235,7 +1629,12 @@ class HoudiniSceneExporter:
         return bool(self._try_method(template, "isHidden", False))
 
     def _parm_tuple_is_at_default(self, parm_tuple: Any) -> bool:
-        value = self._safe_method(parm_tuple, "isAtDefault", None)
+        # compare_expressions=True is essential: the HOM default compares only
+        # evaluated values, so an expression evaluating to 0/1 can otherwise be
+        # incorrectly treated as an unchanged default and omitted in compact mode.
+        value = self._try_method(parm_tuple, "isAtDefault", None, True, True)
+        if value is None:
+            value = self._safe_method(parm_tuple, "isAtDefault", None)
         if value is None:
             return False
         return bool(value)
@@ -1252,16 +1651,30 @@ class HoudiniSceneExporter:
         tuple_name = str(tuple_record.get("name") or "").lower()
         label = str(tuple_record.get("label") or "").lower()
         template = tuple_record.get("template", {})
-        template_text = " ".join(
-            str(template.get(key, "")).lower()
-            for key in ("class", "type", "data_type", "string_type", "tags")
-        )
-        name_says_code = any(hint in tuple_name or hint in label or hint in template_text for hint in CODE_NAME_HINTS)
+        template_class = str(template.get("class") or "")
+        # Executable snippets are stored in string parameters. Numeric channel
+        # expressions such as ch("../foo") are parameter sources, not code
+        # blocks, even though their text happens to look like a function call.
+        if template_class and "StringParmTemplate" not in template_class:
+            return blocks
+        if template.get("menu_items") or template.get("menu_labels"):
+            # Script-language selectors contain values such as "hscript" or
+            # "python" but are not themselves executable script bodies.
+            return blocks
+
+        # ParmTemplate tags frequently contain callback metadata on ordinary
+        # HDA controls. Treating the whole tags dictionary as a name hint turns
+        # most of an HDA interface into false-positive "Code params".
+        name_says_code = any(hint in tuple_name or hint in label for hint in CODE_NAME_HINTS)
         for parm in tuple_record.get("parms", []):
             text = self._best_parm_text(parm)
             if not text:
                 continue
-            text_says_code = any(hint in text for hint in CODE_TEXT_HINTS)
+            if parm.get("expression") not in (None, "") or parm.get("keyframes"):
+                # These are already emitted losslessly as Channel source /
+                # Keyframe records. Do not duplicate them as executable code.
+                continue
+            text_says_code = _text_looks_like_code(text)
             if name_says_code or text_says_code:
                 blocks.append(
                     {
@@ -1402,10 +1815,7 @@ class HoudiniSceneExporter:
         return record
 
     def _geometry_summary(self, node: Any) -> Optional[Dict[str, Any]]:
-        geometry_method = _method(node, "geometry")
-        if geometry_method is None:
-            return None
-        geometry = self._safe("%s.geometry" % (_path_of(node) or "<node>"), lambda: geometry_method(), None)
+        geometry = self._node_geometry(node)
         if geometry is None:
             return None
         primitive_samples = self._sample_geometry_elements(geometry, "iterPrims", "prims")
@@ -1709,17 +2119,57 @@ def _houdini_version_suffix(data: Dict[str, Any]) -> str:
 def _llm_footer_lines(data: Dict[str, Any]) -> List[str]:
     version = (data.get("scene", {}) or {}).get("houdini_version")
     label = "Houdini %s" % version if version else "Houdini"
+    if (data.get("options", {}) or {}).get("markdown_mode") in ("smart", "rbd_smart"):
+        omission_rule = (
+            "Smart セクションで記載のない現在有効な UI 設定は Houdini のデフォルト値です。"
+            "非表示の内部パラメータは意図的に対象外であり、その値を推測しないでください。"
+        )
+    else:
+        omission_rule = "それ以外の記載のないパラメータは Houdini のデフォルト値とみなしてください。"
     return [
         "",
         "---",
         "",
+        "**更新について:** %s" % EXPORT_FRESHNESS_NOTICE_JA,
+        "",
         "**アシスタントへ:** 上記はユーザーの現在の %s ネットワークのスナップショットです。"
-        "回答は必ずこのダンプに基づいてください。ノードは上記の正確な名前・パスで参照し、"
-        "記載された値を現在の状態として扱い、記載のないパラメータは Houdini のデフォルト値とみなしてください。"
+        "回答は必ずこのダンプに基づいてください。Path base がある場合は相対見出しをそこへ連結して正確なノードパスとして参照し、"
+        "記載された値を現在の状態として扱ってください。`... +N more` があるノードの省略分は不明であり、"
+        "デフォルト値とはみなさないでください。%s"
         "接続に沿ってデータフローを追い、ノードの仕様に少しでも不確かさがあれば SideFX の最新公式ドキュメントを調べ、"
         "正しい Houdini / VEX の知識に基づいて分析してください。"
-        "このダンプに無い情報は推測せず「不明」と答えてください。" % label,
+        "このダンプに無い情報は推測せず「不明」と答えてください。" % (label, omission_rule),
     ]
+
+
+def _render_packed_rig_tree(record: Any, indent: str = "") -> List[str]:
+    if not isinstance(record, dict):
+        return []
+    raw_paths = record.get("paths", []) or []
+    paths = sorted({str(path) for path in raw_paths if str(path or "").strip()})
+    if not paths:
+        return []
+    folders = {str(path) for path in record.get("folders", []) or []}
+
+    tree: Dict[str, Any] = {}
+    for path in paths:
+        cursor = tree
+        for component in [part for part in path.strip("/").split("/") if part]:
+            cursor = cursor.setdefault(component, {})
+
+    lines = [indent + "- Packed rig tree:", indent + "  - `/`"]
+
+    def emit(children: Dict[str, Any], parent_path: str, depth: int) -> None:
+        for name in sorted(children):
+            child_path = (parent_path.rstrip("/") + "/" + name) if parent_path != "/" else "/" + name
+            grandchildren = children[name]
+            is_folder = bool(grandchildren) or child_path in folders
+            suffix = "/" if is_folder else ""
+            lines.append(indent + "  " * depth + "- `%s%s`" % (name, suffix))
+            emit(grandchildren, child_path, depth + 1)
+
+    emit(tree, "/", 2)
+    return lines
 
 
 # Node-type importance for ordering the per-node sections. LLM attention is
@@ -1753,7 +2203,11 @@ def _compact_node_importance(node: Dict[str, Any]) -> int:
     flags = node.get("flags", {}) or {}
     if flags.get("isDisplayFlagSet") is True or flags.get("isRenderFlagSet") is True:
         score += 8
-    changed = sum(1 for parm_tuple in node.get("parameters", []) or [] if parm_tuple.get("is_at_default") is False)
+    changed = sum(
+        1
+        for parm_tuple in node.get("parameters", []) or []
+        if parm_tuple.get("is_at_default") is False or _parameter_tuple_expression_value(parm_tuple)[0]
+    )
     score += min(changed, 10)
     if node.get("comment"):
         score += 5
@@ -1765,6 +2219,8 @@ def _compact_node_importance(node: Dict[str, Any]) -> int:
 # settings (Houdini puts the most relevant parameters first in the interface).
 COMPACT_IMPORTANT_SCORE = 70
 DEFAULT_COMPACT_IMPORTANT_PARAM_FLOOR = 10
+_COMPACT_DEFAULT_INTERNAL_NAMES = {"generatedcode"}
+_COMPACT_DEFAULT_INTERNAL_PREFIXES = ("vex_", "bind")
 
 
 def _compact_default_parameter_chunks(
@@ -1781,7 +2237,7 @@ def _compact_default_parameter_chunks(
     }
     entries: List[str] = []
     for parm_tuple in parameters:
-        if parm_tuple.get("is_at_default") is not True:
+        if parm_tuple.get("is_at_default") is not True or _parameter_tuple_expression_value(parm_tuple)[0]:
             continue
         template = parm_tuple.get("template", {}) or {}
         if template.get("class") in _ULTRA_UI_NOISE_TEMPLATE_CLASSES:
@@ -1789,6 +2245,8 @@ def _compact_default_parameter_chunks(
         if template.get("class") == "RampParmTemplate" or _compact_folder_is_noise(template):
             continue
         name = str(parm_tuple.get("name") or "")
+        if name in _COMPACT_DEFAULT_INTERNAL_NAMES or name.startswith(_COMPACT_DEFAULT_INTERNAL_PREFIXES):
+            continue
         if ramp_names:
             match = _RAMP_INSTANCE_PATTERN.match(name)
             if match and match.group("base") in ramp_names:
@@ -1817,7 +2275,506 @@ def _attention_ordered_nodes(nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, 
     return front + list(reversed(back))
 
 
-def render_compact_markdown(data: Dict[str, Any]) -> str:
+def _compact_inspector_path_base(nodes: Sequence[Dict[str, Any]]) -> Optional[str]:
+    parent_parts = []
+    for node in nodes:
+        path = str(node.get("path") or "")
+        parts = [part for part in path.strip("/").split("/") if part]
+        if len(parts) > 1:
+            parent_parts.append(parts[:-1])
+    if not parent_parts:
+        return None
+    common = list(parent_parts[0])
+    for parts in parent_parts[1:]:
+        common = common[: min(len(common), len(parts))]
+        for index, (left, right) in enumerate(zip(common, parts)):
+            if left != right:
+                common = common[:index]
+                break
+        if not common:
+            return None
+    return "/" + "/".join(common) if common else None
+
+
+def _compact_path_relative_to_base(path: Any, base: Optional[str]) -> str:
+    text = str(path or "?")
+    if base and text.startswith(base.rstrip("/") + "/"):
+        return text[len(base.rstrip("/") + "/") :]
+    return text
+
+
+def _smart_is_rbd_node(node: Dict[str, Any]) -> bool:
+    node_type = node.get("type", {}) or {}
+    category = _node_type_token(node_type.get("category"))
+    name_with_category = str(node_type.get("name_with_category") or "").strip().lower()
+    if category != "sop" and not name_with_category.startswith("sop/"):
+        return False
+    type_name = _node_type_token(node_type.get("name_with_category") or node_type.get("name"))
+    return type_name.startswith("rbd")
+
+
+def _smart_menu_data(parm_tuple: Dict[str, Any]) -> Tuple[List[Any], List[Any]]:
+    template = parm_tuple.get("template", {}) or {}
+    items = list(template.get("menu_items") or [])
+    labels = list(template.get("menu_labels") or [])
+    for parm in parm_tuple.get("parms", []) or []:
+        live_items = parm.get("menu_items") or []
+        live_labels = parm.get("menu_labels") or []
+        if live_items or live_labels:
+            return list(live_items), list(live_labels)
+    return items, labels
+
+
+def _smart_is_menu(parm_tuple: Dict[str, Any]) -> bool:
+    template = parm_tuple.get("template", {}) or {}
+    menu_type = str(template.get("menu_type") or "").lower()
+    if template.get("class") == "StringParmTemplate" and (
+        "stringtoggle" in menu_type or "stringreplace" in menu_type
+    ):
+        # These are editable text/pattern fields with a helper menu, not a
+        # single-choice UI. Their current text must not be replaced by one of
+        # the helper entries.
+        return False
+    items, labels = _smart_menu_data(parm_tuple)
+    return bool(items or labels)
+
+
+def _smart_is_value_parameter(parm_tuple: Dict[str, Any]) -> bool:
+    template = parm_tuple.get("template", {}) or {}
+    template_class = str(template.get("class") or "")
+    if template_class in _ULTRA_UI_NOISE_TEMPLATE_CLASSES:
+        return False
+    if _compact_folder_is_noise(template):
+        return False
+    if template.get("is_hidden") is True:
+        return False
+    if parm_tuple.get("ui_visible") is False and template_class != "RampParmTemplate":
+        # A hou.Ramp container itself reports invisible; its visible multiparm
+        # children are the actual ramp editor. Keep the container so those
+        # children can be collapsed back into one UI row.
+        return False
+    return bool(parm_tuple.get("label") or template.get("label"))
+
+
+def _smart_ramp_state(
+    parameters: Sequence[Dict[str, Any]],
+) -> Tuple[set, Dict[str, str], set]:
+    ramp_names = {
+        str(parm_tuple.get("name"))
+        for parm_tuple in parameters
+        if (parm_tuple.get("template", {}) or {}).get("class") == "RampParmTemplate"
+    }
+    instance_names: set = set()
+    instances_by_ramp: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    changed_ramps: set = set()
+    for parm_tuple in parameters:
+        name = str(parm_tuple.get("name") or "")
+        if name in ramp_names:
+            if parm_tuple.get("is_at_default") is False or _parameter_tuple_expression_value(parm_tuple)[0]:
+                changed_ramps.add(name)
+            continue
+        match = _RAMP_INSTANCE_PATTERN.match(name)
+        if not match or match.group("base") not in ramp_names:
+            continue
+        instance_names.add(name)
+        base = match.group("base")
+        channel = match.group("channel")
+        slot = instances_by_ramp.setdefault(base, {}).setdefault(int(match.group("index")), {})
+        if channel == "interp":
+            menu_label = _compact_menu_value_label(parm_tuple, _compact_parameter_scalar(parm_tuple))
+            slot[channel] = menu_label if menu_label is not None else _compact_parameter_scalar(parm_tuple)
+        else:
+            slot[channel] = _compact_parameter_scalar(parm_tuple)
+        if parm_tuple.get("is_at_default") is False or _parameter_tuple_expression_value(parm_tuple)[0]:
+            changed_ramps.add(base)
+
+    summaries = {
+        name: summary
+        for name, summary in (
+            (name, _compact_ramp_summary(instances_by_ramp.get(name, {}))) for name in ramp_names
+        )
+        if summary
+    }
+    return instance_names, summaries, changed_ramps
+
+
+def _smart_selected_parameters(
+    parameters: Sequence[Dict[str, Any]],
+    minimum_rows: int = 0,
+) -> List[Dict[str, Any]]:
+    """Keep effective UI settings without recreating every default widget."""
+    selected: List[Dict[str, Any]] = []
+    leading_defaults: List[Dict[str, Any]] = []
+    ramp_instance_names, _ramp_summaries, changed_ramps = _smart_ramp_state(parameters)
+    for parm_tuple in parameters:
+        if not _smart_is_value_parameter(parm_tuple):
+            continue
+        name = str(parm_tuple.get("name") or "")
+        if name in ramp_instance_names:
+            continue
+        template = parm_tuple.get("template", {}) or {}
+        has_expression = _parameter_tuple_expression_value(parm_tuple)[0]
+        default_state = parm_tuple.get("is_at_default")
+        changed = (
+            default_state is False
+            or (default_state is None and has_expression)
+            or name in changed_ramps
+        )
+        disabled = parm_tuple.get("ui_disabled") is True
+
+        # A disabled default does not affect the current result. A disabled
+        # edited value is retained so the LLM can see the value waiting behind
+        # the current UI switch, and it is explicitly marked as disabled.
+        if disabled and not changed:
+            continue
+        if changed:
+            selected.append(parm_tuple)
+            continue
+        if template.get("class") != "RampParmTemplate":
+            leading_defaults.append(parm_tuple)
+
+    # Preserve the top of the actual Parameter Pane even on an untouched node,
+    # matching compact mode's useful-default floor. Changed menu selectors are
+    # retained above; untouched selectors are defaults and need no repetition.
+    if len(selected) < minimum_rows:
+        for parm_tuple in leading_defaults:
+            if parm_tuple not in selected:
+                selected.append(parm_tuple)
+            if len(selected) >= minimum_rows:
+                break
+
+    # Houdini can place multiple ParmTemplates on one visual row. If one side
+    # of such a row is selected, retain its partner so a hidden-label checkbox
+    # never leaks its internal name into the text.
+    selected_ids = {id(parm_tuple) for parm_tuple in selected}
+    for index, parm_tuple in enumerate(parameters):
+        template = parm_tuple.get("template", {}) or {}
+        if id(parm_tuple) in selected_ids and template.get("join_with_next") is True:
+            if index + 1 < len(parameters) and _smart_is_value_parameter(parameters[index + 1]):
+                selected.append(parameters[index + 1])
+                selected_ids.add(id(parameters[index + 1]))
+        if id(parm_tuple) in selected_ids and template.get("is_label_hidden") is True and index > 0:
+            previous = parameters[index - 1]
+            previous_template = previous.get("template", {}) or {}
+            if previous_template.get("join_with_next") is True and _smart_is_value_parameter(previous):
+                selected.append(previous)
+                selected_ids.add(id(previous))
+
+    parameter_order = {id(parm_tuple): index for index, parm_tuple in enumerate(parameters)}
+    return sorted(
+        {id(parm_tuple): parm_tuple for parm_tuple in selected}.values(),
+        key=lambda parm_tuple: parameter_order.get(id(parm_tuple), 0),
+    )
+
+
+def _smart_evaluated_value(parm_tuple: Dict[str, Any]) -> Any:
+    value = parm_tuple.get("values")
+    if value is None:
+        values = [
+            parm.get("evaluated_value")
+            for parm in parm_tuple.get("parms", []) or []
+            if parm.get("evaluated_value") is not None
+        ]
+        value = values if values else parm_tuple.get("raw_values")
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def _smart_toggle_label(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("0", "off", "false", "no"):
+            return "Off"
+        if normalized in ("1", "on", "true", "yes"):
+            return "On"
+    return "On" if bool(value) else "Off"
+
+
+def _smart_plain_value(value: Any) -> str:
+    value = _compact_prepare_value(value)
+    if isinstance(value, (list, tuple)):
+        return "(" + ", ".join(_smart_plain_value(component) for component in value) + ")"
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if isinstance(value, float):
+        return "%g" % value
+    if value is None:
+        return "none"
+    return str(value).replace("\n", "\\n")
+
+
+def _smart_value_text(parm_tuple: Dict[str, Any], ramp_summary: Optional[str] = None) -> str:
+    if ramp_summary:
+        return _markdown_inline_code(ramp_summary, 240)
+    value = _smart_evaluated_value(parm_tuple)
+    template = parm_tuple.get("template", {}) or {}
+    if _smart_is_menu(parm_tuple):
+        menu_value = value
+        items, _labels = _smart_menu_data(parm_tuple)
+        for parm in parm_tuple.get("parms", []) or []:
+            for key in ("unexpanded_string", "raw_value"):
+                candidate = parm.get(key)
+                if candidate is not None and any(str(item) == str(candidate) for item in items):
+                    menu_value = candidate
+                    break
+        label = _compact_menu_value_label(parm_tuple, menu_value)
+        if label is None:
+            # Never fall back to opaque numeric menu indices in this mode.
+            return "*UI choice label unavailable*"
+        return _markdown_inline_code(label)
+    if template.get("class") == "ToggleParmTemplate":
+        return _markdown_inline_code(_smart_toggle_label(value))
+    return _markdown_inline_code(_smart_plain_value(value), 240)
+
+
+def _smart_component_label(index: int, count: int, component_labels: Sequence[Any]) -> Optional[str]:
+    if count <= 1:
+        return None
+    if index < len(component_labels):
+        label = str(component_labels[index] or "").strip()
+        if label and not label.isdigit():
+            return "%s component" % label
+    ordinals = ("first", "second", "third", "fourth")
+    if index < len(ordinals):
+        return "%s component" % ordinals[index]
+    return "component %d" % (index + 1)
+
+
+def _smart_component_expression_sources(parm_tuple: Dict[str, Any]) -> List[Optional[str]]:
+    parms = parm_tuple.get("parms", []) or []
+    if parm_tuple.get("is_at_default") is True:
+        return [None for _parm in parms]
+    template = parm_tuple.get("template", {}) or {}
+    default_expressions = template.get("default_expression")
+    if not isinstance(default_expressions, (list, tuple)):
+        default_expressions = [default_expressions]
+    sources: List[Optional[str]] = []
+    for index, parm in enumerate(parms):
+        source = _parm_record_expression_source(parm)
+        if source in (None, ""):
+            sources.append(None)
+            continue
+        default_source = default_expressions[index] if index < len(default_expressions) else None
+        if str(source) == str(default_source or ""):
+            # Stock HDAs contain many implementation links. They are part of
+            # the node definition, not expressions entered by the user.
+            sources.append(None)
+            continue
+        sources.append(str(source))
+    return sources
+
+
+def _smart_value_with_inline_component_expressions(
+    parm_tuple: Dict[str, Any],
+    ramp_summary: Optional[str] = None,
+) -> Tuple[str, bool]:
+    normal_value = _smart_value_text(parm_tuple, ramp_summary)
+    if ramp_summary or _smart_is_menu(parm_tuple):
+        return normal_value, False
+    values = _smart_evaluated_value(parm_tuple)
+    parms = parm_tuple.get("parms", []) or []
+    if not isinstance(values, (list, tuple)) or len(values) <= 1 or len(values) != len(parms):
+        return normal_value, False
+    sources = _smart_component_expression_sources(parm_tuple)
+    if not any(source not in (None, "") for source in sources):
+        return normal_value, False
+    components = []
+    for value, source in zip(values, sources):
+        component = _markdown_inline_code(_smart_plain_value(value), 120)
+        if source not in (None, ""):
+            component += " ← expression " + _markdown_inline_code(source)
+        components.append(component)
+    return "(" + ", ".join(components) + ")", True
+
+
+def _smart_expression_sources(parm_tuple: Dict[str, Any]) -> List[str]:
+    parms = parm_tuple.get("parms", []) or []
+    template = parm_tuple.get("template", {}) or {}
+    component_labels = list(template.get("component_labels") or [])
+    sources: List[str] = []
+    for index, source in enumerate(_smart_component_expression_sources(parm_tuple)):
+        if source in (None, ""):
+            continue
+        component = _smart_component_label(index, len(parms), component_labels)
+        if component:
+            sources.append("%s → %s" % (component, _markdown_inline_code(source)))
+        else:
+            sources.append(_markdown_inline_code(source))
+    return sources
+
+
+def _smart_channel_lines(
+    parm_tuple: Dict[str, Any],
+    label: str,
+    path_base: Optional[str],
+) -> List[str]:
+    lines: List[str] = []
+    parms = parm_tuple.get("parms", []) or []
+    template = parm_tuple.get("template", {}) or {}
+    component_labels = list(template.get("component_labels") or [])
+    default_expressions = template.get("default_expression")
+    if not isinstance(default_expressions, (list, tuple)):
+        default_expressions = [default_expressions]
+    tuple_is_default = parm_tuple.get("is_at_default") is True
+    for index, parm in enumerate(parms):
+        component = _smart_component_label(index, len(parms), component_labels)
+        display_label = "%s %s" % (label, component) if component else label
+        source = _parm_record_expression_source(parm)
+        default_source = default_expressions[index] if index < len(default_expressions) else None
+        is_default_expression = tuple_is_default or (
+            source not in (None, "") and str(source) == str(default_source or "")
+        )
+        referenced_parm = parm.get("referenced_parm")
+        if referenced_parm and not is_default_expression:
+            target = _compact_path_relative_to_base(referenced_parm, path_base)
+            lines.append("  - %s source target: %s" % (display_label, _markdown_inline_code(target)))
+        alias = parm.get("alias")
+        if alias not in (None, ""):
+            lines.append("  - %s channel alias: %s" % (display_label, _markdown_inline_code(alias)))
+        chop_override = parm.get("chop_override")
+        if isinstance(chop_override, dict) and chop_override:
+            lines.append(
+                "  - %s CHOP override: %s / %s"
+                % (
+                    display_label,
+                    _markdown_inline_code(chop_override.get("chop_node") or "?"),
+                    _markdown_inline_code(chop_override.get("track_name") or "?"),
+                )
+            )
+
+        keyframes = [] if is_default_expression else list(parm.get("keyframes", []) or [])
+        if len(keyframes) == 1:
+            only_key = keyframes[0]
+            try:
+                is_frame_one = float(only_key.get("frame")) == 1.0
+            except Exception:
+                is_frame_one = False
+            only_expression = only_key.get("expression")
+            if is_frame_one and (
+                only_expression == source or _is_trivial_expression_source(only_expression)
+            ):
+                keyframes = []
+        for keyframe in keyframes:
+            frame = keyframe.get("frame")
+            time = keyframe.get("time")
+            if frame is not None:
+                try:
+                    position = "F%g" % float(frame)
+                except Exception:
+                    position = "F%s" % frame
+            elif time is not None:
+                position = "t=%s" % time
+            else:
+                position = "position=?"
+            fields = []
+            if keyframe.get("expression") not in (None, ""):
+                fields.append("expression=%s" % _markdown_inline_code(keyframe.get("expression")))
+            if keyframe.get("value") is not None:
+                fields.append("value=%s" % _markdown_inline_code(keyframe.get("value")))
+            if not fields:
+                fields.append("key data captured in JSON")
+            lines.append("  - %s key %s: %s" % (display_label, position, ", ".join(fields)))
+    return lines
+
+
+def _smart_parameter_lines(
+    node: Dict[str, Any],
+    parameters: Sequence[Dict[str, Any]],
+    path_base: Optional[str],
+) -> Tuple[List[str], set]:
+    if _smart_is_rbd_node(node):
+        minimum_rows = 12
+    elif _compact_node_importance(node) >= COMPACT_IMPORTANT_SCORE:
+        minimum_rows = DEFAULT_COMPACT_IMPORTANT_PARAM_FLOOR
+    else:
+        minimum_rows = 0
+    selected = _smart_selected_parameters(parameters, minimum_rows=minimum_rows)
+    if not selected:
+        return [], set()
+
+    lines: List[str] = []
+    selected_names = set()
+    _ramp_instance_names, ramp_summaries, _changed_ramps = _smart_ramp_state(parameters)
+    current_folders: Optional[Tuple[str, ...]] = None
+    parameter_order = {id(parm_tuple): index for index, parm_tuple in enumerate(parameters)}
+    selected_index = 0
+    while selected_index < len(selected):
+        parm_tuple = selected[selected_index]
+        members = [parm_tuple]
+        while members[-1].get("template", {}).get("join_with_next") is True:
+            next_selected_index = selected_index + len(members)
+            if next_selected_index >= len(selected):
+                break
+            next_parm = selected[next_selected_index]
+            if parameter_order.get(id(next_parm)) != parameter_order.get(id(members[-1]), -2) + 1:
+                break
+            if tuple(next_parm.get("folders") or []) != tuple(parm_tuple.get("folders") or []):
+                break
+            members.append(next_parm)
+
+        folders = tuple(str(folder) for folder in (parm_tuple.get("folders") or []) if str(folder))
+        if folders != current_folders:
+            lines.append("")
+            lines.append("#### UI: %s" % (" / ".join(folders) if folders else "Main"))
+            lines.append("")
+            current_folders = folders
+
+        label_member = next(
+            (
+                member
+                for member in members
+                if member.get("template", {}).get("is_label_hidden") is not True
+            ),
+            members[-1],
+        )
+        label_template = label_member.get("template", {}) or {}
+        label = str(label_member.get("label") or label_template.get("label") or "UI parameter")
+        value_texts = []
+        inline_expression_members: set = set()
+        for member in members:
+            member_value, expression_inlined = _smart_value_with_inline_component_expressions(
+                member,
+                ramp_summaries.get(str(member.get("name") or "")),
+            )
+            value_texts.append(member_value)
+            if expression_inlined:
+                inline_expression_members.add(id(member))
+        if len(members) > 1:
+            labelled_values = []
+            for member, member_value in zip(members, value_texts):
+                member_template = member.get("template", {}) or {}
+                if member_template.get("is_label_hidden") is True:
+                    if member_template.get("class") == "ToggleParmTemplate":
+                        member_label = "checkbox"
+                    elif _smart_is_menu(member):
+                        member_label = "choice"
+                    else:
+                        member_label = "value"
+                else:
+                    member_label = str(member.get("label") or member_template.get("label") or "UI parameter")
+                labelled_values.append("%s: %s" % (member_label, member_value))
+            row = "- " + "; ".join(labelled_values)
+        else:
+            row = "- %s: %s" % (label, value_texts[0])
+        expression_sources = []
+        for member in members:
+            if id(member) not in inline_expression_members:
+                expression_sources.extend(_smart_expression_sources(member))
+        if expression_sources:
+            row += "; expression: " + ", ".join(expression_sources)
+        if all(member.get("ui_disabled") is True for member in members):
+            row += " *(disabled in the current UI)*"
+        lines.append(row)
+        for member in members:
+            lines.extend(_smart_channel_lines(member, label, path_base))
+            if member.get("name"):
+                selected_names.add(str(member.get("name")))
+        selected_index += len(members)
+    return lines, selected_names
+
+
+def render_compact_markdown(data: Dict[str, Any], smart: bool = False) -> str:
     nodes = sorted(data.get("nodes", []), key=lambda row: str(row.get("path", "")))
     connections = data.get("connections", [])
     code_blocks = data.get("code_blocks", [])
@@ -1826,7 +2783,10 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append("# Houdini Scene Summary%s" % _houdini_version_suffix(data))
     lines.append("")
+    lines.append("- Exporter: `%s %s`" % (EXPORTER_NAME, SCHEMA_VERSION))
     lines.append("- Connection notation: `A -> B -> C` means each node's first output feeds the next node's first input; other ports are marked like `[output2]` / `[input3: Constraint Geometry]`.")
+    if smart:
+        lines.append("- Mode: `Smart (experimental)`. Node settings use the current visible Houdini UI labels, folder labels, and menu choice labels; hidden internal parameters and numeric menu tokens are omitted. Code-focused nodes retain their compact code-oriented presentation.")
     lines.append("")
 
     lines.append("## Connections")
@@ -1840,17 +2800,30 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
 
     lines.append("## Inspector Settings")
     lines.append("")
+    inspector_path_base = _compact_inspector_path_base(nodes)
+    if inspector_path_base:
+        lines.append(
+            "- Path base: `%s/` (node headings below are relative to this exact path)."
+            % inspector_path_base.rstrip("/")
+        )
+        lines.append("")
     inline_code_keys = set()
     for node in _attention_ordered_nodes(nodes):
-        if _node_type_record_suppresses_parameters(node.get("type", {})):
+        node_parameters = node.get("parameters", []) or []
+        if (
+            _node_type_record_suppresses_parameters(node.get("type", {}))
+            and not _parameters_have_channel_details(node_parameters)
+        ):
             continue
         code_refs = [block for block in node.get("code_blocks", []) if block.get("node_path") == node.get("path")]
         comment = node.get("comment")
         node_type = node.get("type", {}).get("name_with_category") or node.get("type", {}).get("name")
         type_description = node.get("type", {}).get("description")
         is_wrangle = _compact_is_wrangle_node(node)
-        param_chunks = [] if is_wrangle else _compact_parameter_chunks(node.get("parameters", []))
-        heading = "### `%s` type=`%s`" % (node.get("path"), node_type)
+        is_smart_node = smart and not is_wrangle
+        param_chunks = [] if (is_wrangle or is_smart_node) else _compact_parameter_chunks(node_parameters)
+        heading_path = _compact_path_relative_to_base(node.get("path"), inspector_path_base)
+        heading = "### `%s` type=`%s`" % (heading_path, node_type)
         if type_description and _compact_condense(type_description) != _compact_condense(_node_type_token(node_type)):
             heading += " (%s)" % type_description
         lines.append(heading)
@@ -1859,14 +2832,23 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
             lines.append("- Flags: `%s`" % ",".join(flags))
         if comment:
             lines.append("- Comment: %s" % _inline_text(str(comment), 240))
+        lines.extend(_render_packed_rig_tree(node.get("packed_rig_tree")))
         if is_wrangle:
             wrangle_lines, wrangle_code_keys = _compact_wrangle_lines(node)
             lines.extend(wrangle_lines)
             inline_code_keys.update(wrangle_code_keys)
+        smart_selected_names: set = set()
+        if is_smart_node:
+            smart_lines, smart_selected_names = _smart_parameter_lines(node, node_parameters, inspector_path_base)
+            lines.extend(smart_lines)
+            for block in code_refs:
+                block_tuple_name = block.get("tuple_name") or block.get("parm_name")
+                if str(block_tuple_name or "") not in smart_selected_names:
+                    inline_code_keys.add(_compact_code_key(block))
         if param_chunks:
             for chunk in param_chunks:
                 lines.append("- Params: %s" % chunk)
-        if not is_wrangle and _compact_node_importance(node) >= COMPACT_IMPORTANT_SCORE:
+        if not is_wrangle and not is_smart_node and _compact_node_importance(node) >= COMPACT_IMPORTANT_SCORE:
             # Count only the entries actually rendered, not hidden folder/ramp noise;
             # otherwise nodes full of "changed" folder parms never get their Defaults floor.
             changed_count = len(_compact_parameter_entries(node.get("parameters", []) or []))
@@ -1876,9 +2858,25 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
             )
             for chunk in default_chunks:
                 lines.append("- Defaults: %s" % chunk)
+        # Expressions are already shown in Params. Compact mode adds only the
+        # information Params cannot carry: resolved links, real animation keys,
+        # aliases, and CHOP overrides.
+        if not is_smart_node:
+            lines.extend(
+                _render_parameter_channel_details(
+                    node_parameters,
+                    "- ",
+                    include_source=False,
+                    compact=True,
+                    path_base=inspector_path_base,
+                )
+            )
         visible_code_refs = [block for block in code_refs if _compact_code_key(block) not in inline_code_keys]
         if visible_code_refs:
-            refs = ", ".join("`%s`" % (block.get("parm_path") or block.get("parm_name")) for block in visible_code_refs)
+            refs = ", ".join(
+                "`%s`" % (block.get("parm_name") or str(block.get("parm_path") or "").rsplit("/", 1)[-1])
+                for block in visible_code_refs
+            )
             lines.append("- Code params: %s" % refs)
         lines.append("")
 
@@ -1893,7 +2891,9 @@ def render_compact_markdown(data: Dict[str, Any]) -> str:
             text_record = block.get("text", {})
             text = text_record.get("text", "") if isinstance(text_record, dict) else ""
             language = block.get("language_guess") or "text"
-            lines.append("### Code %d: `%s` `%s`" % (index, block.get("node_path"), block.get("parm_path")))
+            code_node = _compact_path_relative_to_base(block.get("node_path"), inspector_path_base)
+            code_parm = block.get("parm_name") or str(block.get("parm_path") or "").rsplit("/", 1)[-1]
+            lines.append("### Code %d: `%s` parm=`%s`" % (index, code_node, code_parm))
             lines.append("")
             lines.append("```%s" % language)
             lines.append(str(text).rstrip())
@@ -2184,9 +3184,40 @@ def _compact_parameter_by_name(parameters: Sequence[Dict[str, Any]], name: str) 
     return None
 
 
+def _parameter_tuple_expression_value(parm_tuple: Dict[str, Any]) -> Tuple[bool, Any]:
+    """Return a component-aligned raw value when any component has an expression."""
+    parms = parm_tuple.get("parms", []) or []
+    if not any(_parm_record_expression_source(parm) is not None for parm in parms):
+        return False, None
+
+    values: List[Any] = []
+    for parm in parms:
+        expression_source = _parm_record_expression_source(parm)
+        if expression_source is not None:
+            values.append(expression_source)
+            continue
+        value = None
+        for key in ("unexpanded_string", "raw_value"):
+            candidate = parm.get(key)
+            if candidate is not None:
+                evaluated = parm.get("evaluated_value")
+                value = evaluated if _is_trivial_expression_source(candidate) and evaluated is not None else candidate
+                break
+        if value is None:
+            value = parm.get("evaluated_value")
+        values.append(value)
+
+    if len(values) == 1:
+        return True, values[0]
+    return True, values
+
+
 def _compact_parameter_scalar(parm_tuple: Optional[Dict[str, Any]]) -> Any:
     if not parm_tuple:
         return None
+    has_expression, expression_value = _parameter_tuple_expression_value(parm_tuple)
+    if has_expression:
+        return expression_value
     value = parm_tuple.get("values")
     if value is None:
         values = []
@@ -2210,6 +3241,22 @@ def _compact_menu_value_label(parm_tuple: Optional[Dict[str, Any]], value: Any) 
     template = parm_tuple.get("template", {}) or {}
     labels = template.get("menu_labels") or []
     items = template.get("menu_items") or []
+    # parm.menuItems()/menuLabels() reflect script-generated menus at the
+    # current node state.  Prefer them over the static ParmTemplate snapshot.
+    # This is especially important for RBD HDAs whose choices change with the
+    # selected material/mode.
+    for parm in parm_tuple.get("parms", []) or []:
+        live_labels = parm.get("menu_labels") or []
+        live_items = parm.get("menu_items") or []
+        if live_labels or live_items:
+            labels = live_labels
+            items = live_items
+            break
+    if items and labels:
+        value_text = str(value)
+        for item, label in zip(items, labels):
+            if str(item) == value_text:
+                return str(label)
     try:
         index = int(value)
     except Exception:
@@ -2218,11 +3265,6 @@ def _compact_menu_value_label(parm_tuple: Optional[Dict[str, Any]], value: Any) 
         return str(labels[index])
     if index is not None and 0 <= index < len(items):
         return str(items[index])
-    if items and labels:
-        value_text = str(value)
-        for item, label in zip(items, labels):
-            if str(item) == value_text:
-                return str(label)
     return None
 
 
@@ -2281,7 +3323,7 @@ def _compact_parameter_chunks(
     if max_params >= 0 and len(entries) > max_params:
         omitted = len(entries) - max_params
         entries = entries[:max_params]
-        entries.append("... +%d more" % omitted)
+        entries.append("... +%d more omitted (unknown here; not assumed default)" % omitted)
     chunks = []
     for index in range(0, len(entries), max_per_line):
         chunks.append("; ".join(entries[index : index + max_per_line]))
@@ -2302,7 +3344,7 @@ def _compact_parameter_entries(
     for parm_tuple in parameters:
         name = str(parm_tuple.get("name") or "")
         if name in ramp_names:
-            if parm_tuple.get("is_at_default") is False:
+            if parm_tuple.get("is_at_default") is False or _parameter_tuple_expression_value(parm_tuple)[0]:
                 ramp_changed.add(name)
             continue
         if not ramp_names:
@@ -2318,7 +3360,7 @@ def _compact_parameter_entries(
             slot[channel] = label if label is not None else _compact_parameter_scalar(parm_tuple)
         else:
             slot[channel] = _compact_parameter_scalar(parm_tuple)
-        if parm_tuple.get("is_at_default") is False:
+        if parm_tuple.get("is_at_default") is False or _parameter_tuple_expression_value(parm_tuple)[0]:
             ramp_changed.add(base)
 
     entries = []
@@ -2326,6 +3368,8 @@ def _compact_parameter_entries(
     for parm_tuple in parameters:
         name = str(parm_tuple.get("name") or "")
         template = parm_tuple.get("template", {}) or {}
+        if template.get("class") in _ULTRA_UI_NOISE_TEMPLATE_CLASSES:
+            continue
         if _compact_folder_is_noise(template):
             continue
         if name in ramp_names:
@@ -2339,7 +3383,7 @@ def _compact_parameter_entries(
             match = _RAMP_INSTANCE_PATTERN.match(name)
             if match and match.group("base") in ramp_names:
                 continue
-        if parm_tuple.get("is_at_default") is True:
+        if parm_tuple.get("is_at_default") is True and not _parameter_tuple_expression_value(parm_tuple)[0]:
             continue
         entry = _compact_parameter_entry(parm_tuple, include_labels)
         if entry:
@@ -2354,14 +3398,19 @@ def _compact_parameter_entry(parm_tuple: Dict[str, Any], include_label: bool = F
     value = _compact_parameter_value(parm_tuple)
     if value is None:
         return None
+    has_expression, _expression_value = _parameter_tuple_expression_value(parm_tuple)
+    operator = " expression=" if has_expression else "="
     if include_label:
         label = parm_tuple.get("label")
         if label and _compact_condense(label) != _compact_condense(str(name)):
-            return "`%s` (%s) = %s" % (name, label, value)
-    return "`%s`=%s" % (name, value)
+            return "`%s` (%s)%s%s" % (name, label, operator, value)
+    return "`%s`%s%s" % (name, operator, value)
 
 
 def _compact_parameter_value(parm_tuple: Dict[str, Any]) -> Optional[str]:
+    has_expression, expression_value = _parameter_tuple_expression_value(parm_tuple)
+    if has_expression:
+        return _compact_value_text(expression_value)
     template = parm_tuple.get("template", {}) or {}
     if template.get("menu_items") or template.get("menu_labels"):
         menu_label = _compact_menu_value_label(parm_tuple, _compact_parameter_scalar(parm_tuple))
@@ -2391,10 +3440,36 @@ def _compact_parameter_value(parm_tuple: Dict[str, Any]) -> Optional[str]:
 
 
 def _compact_value_text(value: Any, limit: int = 160) -> str:
-    return "`%s`" % _compact_plain_text(value, limit)
+    return _markdown_inline_code(_compact_plain_text(value, limit), limit)
+
+
+def _compact_opaque_text_summary(text: str) -> Optional[str]:
+    if len(text) < 256:
+        return None
+    no_whitespace = not bool(re.search(r"\s", text))
+    is_hex_blob = no_whitespace and bool(re.fullmatch(r"[0-9A-Fa-f]+", text))
+    if no_whitespace:
+        simple_chars = sum(character.isalnum() or character in "+/=_-" for character in text)
+        is_encoded_blob = len(text) >= 1024 and simple_chars / float(len(text)) >= 0.98
+    else:
+        is_encoded_blob = False
+    if not (is_hex_blob or is_encoded_blob):
+        return None
+    return "<opaque data: %d chars, sha256=%s>" % (len(text), _sha256_text(text)[:16])
+
+
+def _compact_prepare_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _compact_opaque_text_summary(value) or value
+    if isinstance(value, (list, tuple)):
+        return [_compact_prepare_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _compact_prepare_value(item) for key, item in value.items()}
+    return value
 
 
 def _compact_plain_text(value: Any, limit: int = 160) -> str:
+    value = _compact_prepare_value(value)
     if isinstance(value, str):
         text = value
     else:
@@ -2437,6 +3512,177 @@ def _ultra_compress_values(values: Sequence[Any]) -> List[str]:
 _ULTRA_UI_NOISE_TEMPLATE_CLASSES = ("SeparatorParmTemplate", "LabelParmTemplate", "ButtonParmTemplate")
 
 
+def _expression_metadata_text(kind: Any, language: Any) -> str:
+    pieces = []
+    if language not in (None, ""):
+        pieces.append(str(language).rsplit(".", 1)[-1])
+    if kind not in (None, ""):
+        pieces.append(str(kind))
+    return ", ".join(pieces)
+
+
+def _markdown_inline_code(value: Any, limit: int = 500) -> str:
+    text = _inline_text(str(value), limit)
+    longest_run = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest_run + 1)
+    padding = " " if text.startswith("`") or text.endswith("`") else ""
+    return "%s%s%s%s%s" % (fence, padding, text, padding, fence)
+
+
+def _parameter_channel_detail_lines(
+    parm: Dict[str, Any],
+    indent: str = "- ",
+    include_source: bool = True,
+    compact: bool = False,
+    path_base: Optional[str] = None,
+) -> List[str]:
+    """Render unevaluated channel, keyframe, reference, and CHOP details."""
+    lines: List[str] = []
+    name = parm.get("name") or parm.get("path") or "?"
+    source = _parm_record_expression_source(parm)
+    language = parm.get("expression_language")
+    kind = parm.get("expression_kind") or _expression_source_kind(source, language)
+    metadata = _expression_metadata_text(kind, language)
+    metadata_suffix = " [%s]" % metadata if metadata else ""
+
+    if include_source and source not in (None, ""):
+        lines.append(
+            "%sChannel source `%s`%s: %s"
+            % (indent, name, metadata_suffix, _markdown_inline_code(source))
+        )
+
+    alias = parm.get("alias")
+    if alias not in (None, ""):
+        lines.append("%sChannel alias `%s`: %s" % (indent, name, _markdown_inline_code(alias)))
+
+    referenced_parm = parm.get("referenced_parm")
+    if referenced_parm:
+        reference_display = _compact_path_relative_to_base(referenced_parm, path_base)
+        lines.append(
+            "%sChannel reference target `%s`: %s"
+            % (indent, name, _markdown_inline_code(reference_display))
+        )
+
+    chop_override = parm.get("chop_override")
+    if isinstance(chop_override, dict) and chop_override:
+        chop_node = chop_override.get("chop_node") or "?"
+        track_name = chop_override.get("track_name") or "?"
+        suffixes = []
+        if chop_override.get("active") is not None:
+            suffixes.append("active=%s" % chop_override.get("active"))
+        if chop_override.get("num_samples") is not None:
+            suffixes.append("samples=%s" % chop_override.get("num_samples"))
+        if chop_override.get("override_parm"):
+            suffixes.append("override_parm=%s" % _markdown_inline_code(chop_override.get("override_parm")))
+        suffix = " (" + ", ".join(suffixes) + ")" if suffixes else ""
+        lines.append(
+            "%sCHOP override `%s`: %s track=%s%s"
+            % (
+                indent,
+                name,
+                _markdown_inline_code(chop_node),
+                _markdown_inline_code(track_name),
+                suffix,
+            )
+        )
+
+    keyframes = parm.get("keyframes", []) or []
+    visible_keyframes = list(keyframes)
+    if compact and len(keyframes) == 1:
+        only_key = keyframes[0]
+        only_expression = only_key.get("expression")
+        try:
+            is_frame_one = float(only_key.get("frame")) == 1.0
+        except Exception:
+            is_frame_one = False
+        repeats_source = (
+            source not in (None, "")
+            and only_expression == source
+            and _expression_source_kind(only_expression, only_key.get("expression_language"))
+            != "keyframe_interpolation"
+        )
+        if is_frame_one and (repeats_source or _is_trivial_expression_source(only_expression)):
+            # Houdini stores a regular channel expression as one key at F1.
+            # Params already contains that source, so the key line adds nothing.
+            visible_keyframes = []
+
+    for keyframe in visible_keyframes:
+        frame = keyframe.get("frame")
+        time = keyframe.get("time")
+        if frame is not None:
+            try:
+                position = "F%g" % float(frame)
+            except Exception:
+                position = "F%s" % frame
+        elif time is not None:
+            position = "t=%s" % time
+        else:
+            position = "position=?"
+        key_expression = keyframe.get("expression")
+        key_language = keyframe.get("expression_language")
+        key_kind = keyframe.get("expression_kind") or _expression_source_kind(key_expression, key_language)
+        key_metadata = _expression_metadata_text(key_kind, key_language)
+        key_metadata_suffix = " [%s]" % key_metadata if key_metadata else ""
+        fields = []
+        if key_expression not in (None, ""):
+            fields.append("expression=%s" % _markdown_inline_code(key_expression))
+        if keyframe.get("value") is not None:
+            fields.append("value=%s" % _markdown_inline_code(keyframe.get("value")))
+        for field_name in ("slope", "in_slope", "out_slope", "accel"):
+            field_value = keyframe.get(field_name)
+            if field_value is not None:
+                if compact:
+                    try:
+                        if float(field_value) == 0.0:
+                            continue
+                    except Exception:
+                        pass
+                fields.append("%s=%s" % (field_name, _markdown_inline_code(field_value)))
+        if not fields:
+            fields.append("data captured in JSON")
+        lines.append(
+            "%sKeyframe `%s` %s%s: %s"
+            % (indent, name, position, key_metadata_suffix, ", ".join(fields))
+        )
+    return lines
+
+
+def _parameters_have_channel_details(parameters: Sequence[Dict[str, Any]]) -> bool:
+    for parm_tuple in parameters:
+        for parm in parm_tuple.get("parms", []) or []:
+            if (
+                _parm_record_expression_source(parm) not in (None, "")
+                or _parameter_channel_detail_lines(parm, compact=True)
+                or parm.get("referenced_parm")
+                or parm.get("chop_override")
+                or parm.get("alias")
+            ):
+                return True
+    return False
+
+
+def _render_parameter_channel_details(
+    parameters: Sequence[Dict[str, Any]],
+    indent: str = "- ",
+    include_source: bool = True,
+    compact: bool = False,
+    path_base: Optional[str] = None,
+) -> List[str]:
+    lines: List[str] = []
+    for parm_tuple in parameters:
+        for parm in parm_tuple.get("parms", []) or []:
+            lines.extend(
+                _parameter_channel_detail_lines(
+                    parm,
+                    indent,
+                    include_source,
+                    compact,
+                    path_base,
+                )
+            )
+    return lines
+
+
 def _ultra_parameter_lines(parameters: Sequence[Dict[str, Any]]) -> List[str]:
     visible: List[Dict[str, Any]] = []
     for parm_tuple in parameters:
@@ -2446,7 +3692,11 @@ def _ultra_parameter_lines(parameters: Sequence[Dict[str, Any]]) -> List[str]:
         if _compact_folder_is_noise(template):
             continue
         visible.append(parm_tuple)
-    default_count = sum(1 for parm_tuple in visible if parm_tuple.get("is_at_default") is True)
+    default_count = sum(
+        1
+        for parm_tuple in visible
+        if parm_tuple.get("is_at_default") is True and not _parameter_tuple_expression_value(parm_tuple)[0]
+    )
 
     lines: List[str] = []
     chunks = _compact_parameter_chunks(visible, max_per_line=1, max_params=-1, include_labels=True)
@@ -2454,14 +3704,7 @@ def _ultra_parameter_lines(parameters: Sequence[Dict[str, Any]]) -> List[str]:
         lines.append("- Parameters (changed from defaults):")
         for chunk in chunks:
             lines.append("  - %s" % chunk)
-    for parm_tuple in visible:
-        for parm in parm_tuple.get("parms", []) or []:
-            expression = parm.get("expression")
-            if expression:
-                lines.append("  - `%s` expression: `%s`" % (parm.get("name"), _inline_text(str(expression), 200)))
-            keyframes = parm.get("keyframes")
-            if keyframes:
-                lines.append("  - `%s` keyframes: %d" % (parm.get("name"), len(keyframes)))
+    lines.extend(_render_parameter_channel_details(visible, "  - ", include_source=True))
     if default_count:
         lines.append("- %d parameters at default omitted (full values are in the JSON export)" % default_count)
     return lines
@@ -2601,6 +3844,7 @@ def render_ultra_markdown(data: Dict[str, Any]) -> str:
         comment = node.get("comment")
         if comment:
             lines.append("- Comment: %s" % _inline_text(str(comment), 240))
+        lines.extend(_render_packed_rig_tree(node.get("packed_rig_tree")))
         lines.extend(_ultra_parameter_lines(node.get("parameters", [])))
         lines.append("")
         geometry_summary = node.get("geometry_summary")
@@ -2621,6 +3865,8 @@ def render_markdown(data: Dict[str, Any]) -> str:
     mode = data.get("options", {}).get("markdown_mode", DEFAULT_MARKDOWN_MODE)
     if mode == "compact":
         return render_compact_markdown(data)
+    if mode in ("smart", "rbd_smart"):
+        return render_compact_markdown(data, smart=True)
     if mode in ("attributes", "ultra"):  # "ultra" is the legacy name of attribute mode
         return render_ultra_markdown(data)
 
@@ -2723,6 +3969,7 @@ def _render_nodes(nodes: Sequence[Dict[str, Any]]) -> List[str]:
         comment = node.get("comment")
         if comment:
             lines.append("- Comment: %s" % _inline_text(str(comment)))
+        lines.extend(_render_packed_rig_tree(node.get("packed_rig_tree")))
         lines.extend(_render_node_endpoints("Inputs", node.get("inputs", [])))
         lines.extend(_render_node_endpoints("Outputs", node.get("outputs", [])))
         if node.get("geometry_summary"):
@@ -2828,19 +4075,27 @@ def _render_parameters(parameters: Sequence[Dict[str, Any]]) -> List[str]:
             % (parm_tuple.get("name"), label, type_text, rendered_value)
         )
         for parm in parm_tuple.get("parms", []):
-            expression = parm.get("expression")
+            expression = _parm_record_expression_source(parm)
             raw_value = parm.get("raw_value")
             unexpanded = parm.get("unexpanded_string")
             if expression:
-                lines.append("    - `%s` expression: `%s`" % (parm.get("name"), _inline_text(str(expression))))
+                lines.append(
+                    "    - `%s` expression: %s"
+                    % (parm.get("name"), _markdown_inline_code(expression))
+                )
             elif unexpanded and unexpanded != raw_value:
-                lines.append("    - `%s` unexpanded: `%s`" % (parm.get("name"), _inline_text(str(unexpanded))))
-            if parm.get("keyframes"):
-                lines.append("    - `%s` keyframes: `%d`" % (parm.get("name"), len(parm.get("keyframes"))))
+                lines.append(
+                    "    - `%s` unexpanded: %s"
+                    % (parm.get("name"), _markdown_inline_code(unexpanded))
+                )
+            lines.extend(_parameter_channel_detail_lines(parm, "    - ", include_source=False))
     return lines
 
 
 def _parameter_tuple_display_value(parm_tuple: Dict[str, Any]) -> Any:
+    has_expression, expression_value = _parameter_tuple_expression_value(parm_tuple)
+    if has_expression:
+        return expression_value
     value = parm_tuple.get("values")
     if value is not None:
         return value
@@ -2976,11 +4231,17 @@ def export_current_scene(
     geometry_node_mode: str = DEFAULT_GEOMETRY_NODE_MODE,
     include_private_attributes: bool = False,
     include_standard_attributes: bool = False,
+    include_packed_rig_trees: bool = DEFAULT_INCLUDE_PACKED_RIG_TREES,
     include_bypassed_nodes: bool = DEFAULT_INCLUDE_BYPASSED_NODES,
     include_scene_paths: bool = DEFAULT_INCLUDE_SCENE_PATHS,
     include_network_items: bool = False,
     temporary_frame: Optional[float] = None,
 ) -> Dict[str, str]:
+    if markdown_mode in ("smart", "rbd_smart"):
+        # The mode is defined by the Parameter Pane's evaluated Hide When /
+        # Disable When state and live dynamic menus, so state capture is not
+        # optional even if the corresponding advanced checkbox is off.
+        include_parameter_state = True
     if markdown_mode in ("attributes", "ultra"):
         # Attribute mode ("ultra" is its legacy name) dumps geometry attributes:
         # it needs cooked geometry and sample values.
@@ -3006,6 +4267,7 @@ def export_current_scene(
         geometry_node_mode=geometry_node_mode,
         include_private_attributes=include_private_attributes,
         include_standard_attributes=include_standard_attributes,
+        include_packed_rig_trees=include_packed_rig_trees,
         include_bypassed_nodes=include_bypassed_nodes,
         include_scene_paths=include_scene_paths,
         include_network_items=include_network_items,
@@ -3123,7 +4385,8 @@ class HoudiniSceneExportDialog:
 
         note = QtWidgets.QLabel(
             "標準設定では現在フレーム1枚だけパラメータを評価します。"
-            "SOP ジオメトリ/アトリビュート取得やノード状態問い合わせは行いません。"
+            "通常の SOP アトリビュート取得やノード状態問い合わせは行いません。"
+            "パック済みリグの候補ノードは階層確認のため cook される場合があります。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -3157,7 +4420,12 @@ class HoudiniSceneExportDialog:
         _set_combo_value(self.format_combo, "markdown")
         format_layout.addRow("形式", self.format_combo)
         self.markdown_mode_combo = QtWidgets.QComboBox()
-        for label, value in (("コンパクト", "compact"), ("詳細", "verbose"), ("アトリビュート（選択ノードの属性値・cookします）", "attributes")):
+        for label, value in (
+            ("コンパクト", "compact"),
+            ("スマートモード（実験的）", "smart"),
+            ("詳細", "verbose"),
+            ("アトリビュート（選択ノードの属性値・cookします）", "attributes"),
+        ):
             self.markdown_mode_combo.addItem(label, value)
         _set_combo_value(self.markdown_mode_combo, DEFAULT_MARKDOWN_MODE)
         format_layout.addRow("Markdown", self.markdown_mode_combo)
@@ -3232,6 +4500,9 @@ class HoudiniSceneExportDialog:
         geo_layout.addRow("", self.standard_attrs_check)
         self.private_attrs_check = QtWidgets.QCheckBox("private 属性も含める")
         geo_layout.addRow("", self.private_attrs_check)
+        self.packed_rig_trees_check = QtWidgets.QCheckBox("パック済みキャラクターのリグツリーを含める")
+        self.packed_rig_trees_check.setChecked(DEFAULT_INCLUDE_PACKED_RIG_TREES)
+        geo_layout.addRow("", self.packed_rig_trees_check)
         advanced_layout.addWidget(geo_group)
         layout.addWidget(advanced_section)
 
@@ -3330,6 +4601,7 @@ class HoudiniSceneExportDialog:
             "geometry_node_mode": geometry_node_mode,
             "include_private_attributes": self.private_attrs_check.isChecked(),
             "include_standard_attributes": self.standard_attrs_check.isChecked(),
+            "include_packed_rig_trees": self.packed_rig_trees_check.isChecked(),
             "include_bypassed_nodes": self.include_bypassed_check.isChecked(),
             "include_network_items": self.include_network_items_check.isChecked(),
             "include_scene_paths": self.include_scene_paths_check.isChecked(),
@@ -3433,7 +4705,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selected", action="store_true", help="Export selected nodes only, without recursing into their children.")
     parser.add_argument("--out", default=None, help="Output file base/path or directory. Default: $HIP/<hip>_scene_text_<timestamp>.")
     parser.add_argument("--format", choices=("markdown", "json", "both"), default="markdown", help="Output format.")
-    parser.add_argument("--markdown-mode", choices=("compact", "verbose", "attributes", "ultra"), default=DEFAULT_MARKDOWN_MODE, help="Markdown detail level. compact is the default. attributes dumps geometry attribute/group values for the exported nodes (works with multiple selected nodes; forces geometry cooking). ultra is a deprecated alias for attributes.")
+    parser.add_argument("--markdown-mode", choices=("compact", "smart", "rbd_smart", "verbose", "attributes", "ultra"), default=DEFAULT_MARKDOWN_MODE, help="Markdown detail level. smart renders node settings using current visible Parameter Pane labels and menu choices. rbd_smart is a deprecated alias for smart. attributes dumps geometry attribute/group values for the exported nodes (works with multiple selected nodes; forces geometry cooking). ultra is a deprecated alias for attributes.")
     parser.add_argument("--include-scene-paths", action="store_true", help="Include HIP and loaded HDA file paths. Off by default.")
     parser.add_argument("--changed-only", action="store_true", help="Only include parameters that are not at default values.")
     parser.add_argument("--evaluate-parameters", dest="evaluate_parameters", action="store_true", default=DEFAULT_EVALUATE_PARAMETERS, help="Evaluate parameter values on the current frame. On by default.")
@@ -3458,6 +4730,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-standard-attributes", action="store_true", help="Include common point/vertex attributes such as P, N, uv, Cd, v, pscale.")
     parser.add_argument("--include-private-attributes", action="store_true", help="Include private geometry attributes.")
     parser.add_argument("--skip-private-attributes", action="store_true", help="Deprecated compatibility option. Private attributes are skipped by default.")
+    parser.add_argument("--include-packed-rig-trees", dest="include_packed_rig_trees", action="store_true", default=DEFAULT_INCLUDE_PACKED_RIG_TREES, help="Include packed character folder hierarchies from candidate SOP nodes. On by default.")
+    parser.add_argument("--skip-packed-rig-trees", dest="include_packed_rig_trees", action="store_false", help="Do not query SOP geometry for packed character folder hierarchies.")
     return parser
 
 
@@ -3514,6 +4788,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             geometry_node_mode=geometry_node_mode,
             include_private_attributes=args.include_private_attributes and not args.skip_private_attributes,
             include_standard_attributes=args.include_standard_attributes,
+            include_packed_rig_trees=args.include_packed_rig_trees,
             include_bypassed_nodes=args.include_bypassed_nodes,
             include_scene_paths=args.include_scene_paths,
             include_network_items=args.include_network_items,
