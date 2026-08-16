@@ -36,8 +36,8 @@ except ImportError:
 
 
 TOOL_NAME = "Houdini Network Preflight"
-VERSION = "0.2.0"
-SCHEMA = "houdini-network-preflight-v2"
+VERSION = "0.3.5"
+SCHEMA = "houdini-network-preflight-v3"
 
 SEVERITY_SCORE = {
     "critical": 400,
@@ -458,6 +458,10 @@ class GeometrySnapshot:
     packed_bad_transforms: int
     packed_primitive_count: int
     polygon_primitive_count: int
+    closed_polygon_primitive_count: int
+    open_polyline_primitive_count: int
+    two_endpoint_open_line_count: int
+    primitive_role_sampled: int
     skeleton_edges: List[Tuple[int, int]]
     errors: List[str]
 
@@ -499,6 +503,11 @@ class GeometrySnapshot:
             "packed_bad_transforms": self.packed_bad_transforms,
             "packed_primitive_count": self.packed_primitive_count,
             "polygon_primitive_count": self.polygon_primitive_count,
+            "closed_polygon_primitive_count": self.closed_polygon_primitive_count,
+            "open_polyline_primitive_count": self.open_polyline_primitive_count,
+            "two_endpoint_open_line_count": self.two_endpoint_open_line_count,
+            "primitive_role_sampled": self.primitive_role_sampled,
+            "primitive_role_complete": self.primitive_role_sampled == self.counts.get("primitives", 0),
             "skeleton_edge_count": len(self.skeleton_edges),
             "errors": list(self.errors),
         }
@@ -761,7 +770,12 @@ def build_geometry_snapshot(
     packed_bad_transforms = 0
     packed_primitive_count = 0
     polygon_primitive_count = 0
-    for prim in primitives[:20_000 if deep else 5_000]:
+    closed_polygon_primitive_count = 0
+    open_polyline_primitive_count = 0
+    two_endpoint_open_line_count = 0
+    primitive_role_limit = 250_000 if deep else 20_000
+    primitive_role_sampled = min(len(primitives), primitive_role_limit)
+    for prim in primitives[:primitive_role_limit]:
         bbox = _safe(lambda prim=prim: prim.boundingBox(), None)
         if bbox is not None:
             size = tuple(_safe(lambda bbox=bbox: bbox.sizevec(), ()) or ())
@@ -780,6 +794,14 @@ def build_geometry_snapshot(
                 packed_bad_transforms += 1
         if "poly" in type_name:
             polygon_primitive_count += 1
+            prim_points = _safe(lambda prim=prim: prim.points(), ()) or ()
+            is_closed = bool(_safe(lambda prim=prim: prim.isClosed(), False))
+            if is_closed:
+                closed_polygon_primitive_count += 1
+            else:
+                open_polyline_primitive_count += 1
+                if len(prim_points) == 2 and point_name_attrib is not None:
+                    two_endpoint_open_line_count += 1
 
     degenerate_primitives = 0
     nonmanifold_edges = 0
@@ -789,14 +811,19 @@ def build_geometry_snapshot(
             prim_points = _safe(lambda prim=prim: prim.points(), ()) or ()
             type_name = str(_safe(lambda prim=prim: prim.type().name(), "") or "").lower()
             if "poly" in type_name:
-                if len(prim_points) < 3:
-                    degenerate_primitives += 1
+                # Open polygons are curves/constraint polylines, not surface
+                # faces.  Their measured area is expected to be zero.
+                if not bool(_safe(lambda prim=prim: prim.isClosed(), False)):
+                    continue
+                indices = [int(_safe(lambda point=point: point.number(), -1)) for point in prim_points]
+                is_degenerate = len(prim_points) < 3 or len(set(indices)) < 3
                 area = _safe(lambda prim=prim: prim.intrinsicValue("measuredarea"), None)
                 if isinstance(area, (int, float)) and abs(float(area)) < 1e-14:
+                    is_degenerate = True
+                if is_degenerate:
                     degenerate_primitives += 1
-                indices = [int(_safe(lambda point=point: point.number(), -1)) for point in prim_points]
                 if len(indices) >= 2:
-                    loop = indices + ([indices[0]] if len(indices) > 2 else [])
+                    loop = indices + [indices[0]]
                     for left, right in zip(loop[:-1], loop[1:]):
                         if left < 0 or right < 0 or left == right:
                             continue
@@ -824,6 +851,10 @@ def build_geometry_snapshot(
         packed_bad_transforms=packed_bad_transforms,
         packed_primitive_count=packed_primitive_count,
         polygon_primitive_count=polygon_primitive_count,
+        closed_polygon_primitive_count=closed_polygon_primitive_count,
+        open_polyline_primitive_count=open_polyline_primitive_count,
+        two_endpoint_open_line_count=two_endpoint_open_line_count,
+        primitive_role_sampled=primitive_role_sampled,
         skeleton_edges=skeleton_edges,
         errors=errors,
     )
@@ -1342,6 +1373,12 @@ class HoudiniNetworkAnalyzer:
                     if key in seen:
                         continue
                     seen.add(key)
+                    child_path = _node_path(child)
+                    constraint_connection_scatter = bool(
+                        "update_constraints" in child_path.lower()
+                        and "connectadjacentpieces" in child_path.lower()
+                        and "scatter" in child_path.lower()
+                    )
                     self.add_issue(
                         "HOUDINI_INTERNAL_HIGH_SIGNAL_MESSAGE",
                         "warning",
@@ -1350,12 +1387,21 @@ class HoudiniNetworkAnalyzer:
                         _node_path(node),
                         "内部ノードに数値付きの高信号メッセージがあります",
                         {
-                            "internal_node": _node_path(child),
+                            "internal_node": child_path,
                             "message": normalized,
+                            "operation_scope": (
+                                "constraint_connection_sampling"
+                                if constraint_connection_scatter
+                                else "internal_operation_not_classified"
+                            ),
+                            "fracture_site_count_not_established": constraint_connection_scatter,
+                            "simulation_behavior_effect_not_established": True,
                         },
-                        "内部ノードの数値上限・生成数・Cook結果を確認してください。",
+                        "Constraint接続用Scatterなら、まずCook時間と生成Constraint被覆を確認してください。Fracture Site数とは別です。"
+                        if constraint_connection_scatter
+                        else "内部ノードの数値上限・生成数・Cook結果を確認してください。",
                         ["performance", "apex_graph"],
-                        [_node_path(child)],
+                        [child_path],
                     )
 
     def _diagnose_geometry_health(self, snapshot: GeometrySnapshot) -> None:
@@ -1371,13 +1417,20 @@ class HoudiniNetworkAnalyzer:
             )
         if snapshot.counts.get("points", 0) == 0 and snapshot.counts.get("primitives", 0) == 0:
             node = _safe(lambda: hou.node(path), None) if hou is not None else None
+            used_output_indices = {
+                int(_safe(lambda connection=connection: connection.outputIndex(), -1))
+                for connection in (_safe(lambda: node.outputConnections(), ()) or ())
+            } if node is not None else set()
+            unused_output_with_other_used_output = bool(
+                used_output_indices and snapshot.output_index not in used_output_indices
+            )
             standalone_control = bool(
                 node is not None
                 and "null" in _node_type_name(node).lower()
                 and not any(item is not None for item in (_safe(lambda: node.inputs(), ()) or ()))
                 and not (_safe(lambda: node.outputs(), ()) or ())
             )
-            if standalone_control:
+            if standalone_control or unused_output_with_other_used_output:
                 return
             self.add_issue(
                 "GEOMETRY_EMPTY",
@@ -1408,11 +1461,35 @@ class HoudiniNetworkAnalyzer:
                 "high",
                 "mesh",
                 path,
-                "縮退Primitiveが検出されました",
-                {"count": snapshot.degenerate_primitives},
-                "PolyDoctor、Clean、Fuse許容値、二次フラクチャー設定を確認してください。",
+                "閉じたSurface Polygonに縮退面が検出されました",
+                {
+                    "closed_surface_degenerate_count": snapshot.degenerate_primitives,
+                    "closed_polygon_count": snapshot.closed_polygon_primitive_count,
+                    "open_polyline_count": snapshot.open_polyline_primitive_count,
+                    "two_endpoint_open_line_count": snapshot.two_endpoint_open_line_count,
+                    "output_index": snapshot.output_index,
+                    "primitive_role_sample_complete": snapshot.primitive_role_sampled == snapshot.counts.get("primitives", 0),
+                },
+                "閉じたSurfaceだけを対象にPolyDoctor、Clean、Fuse許容値、Fracture設定を確認してください。",
                 ["rbd_general", "performance"],
             )
+        if self.scan_level == "deep" and snapshot.closed_polygon_primitive_count > 0:
+            node = _safe(lambda: hou.node(path), None) if hou is not None else None
+            node_text = _node_type_text(node) if node is not None else ""
+            if any(token in node_text for token in ("rbdmaterialfracture", "rbdunpack")):
+                self.add_check(
+                    "MESH_CLOSED_SURFACE_HEALTH",
+                    "pass" if snapshot.degenerate_primitives == 0 else "review",
+                    "mesh",
+                    path,
+                    {
+                        "context": "output_%d_closed_surfaces" % snapshot.output_index,
+                        "closed_polygon_count": snapshot.closed_polygon_primitive_count,
+                        "closed_surface_degenerate_count": snapshot.degenerate_primitives,
+                        "open_polyline_count": snapshot.open_polyline_primitive_count,
+                        "primitive_role_sample_complete": snapshot.primitive_role_sampled == snapshot.counts.get("primitives", 0),
+                    },
+                )
         if snapshot.nonmanifold_edges:
             self.add_issue(
                 "MESH_NONMANIFOLD_EDGES",
@@ -1622,6 +1699,8 @@ class HoudiniNetworkAnalyzer:
                         "input_owner": up_owner,
                         "output_owner": None,
                         "compared_stream": "input0_to_output0",
+                        "downstream_reference_to_attribute_not_measured": True,
+                        "causal_effect_not_established": True,
                     },
                     "この属性を下流が使用する場合のみ、ノードの意図と別出力への移動を確認してください。",
                     ["frame_one_explosion", "cache", "apex_graph"],
@@ -1741,15 +1820,25 @@ class HoudiniNetworkAnalyzer:
                     input_nonempty_count = up_stat.sampled - up_stat.empty_count
                     if input_nonempty_count <= 0:
                         continue
+                    canonical_identity = down_stat.name == "name"
+                    canonical_name_stat = downstream.any_stat("name")
+                    canonical_name_nonempty_count = None
+                    if canonical_name_stat is not None:
+                        canonical_name_nonempty_count = canonical_name_stat.sampled - canonical_name_stat.empty_count
                     self.add_issue(
-                        "IDENTITY_ATTRIBUTE_ALL_EMPTY_TRANSITION",
-                        "warning",
-                        "high",
+                        "IDENTITY_ATTRIBUTE_ALL_EMPTY_TRANSITION" if canonical_identity else "AUXILIARY_IDENTITY_ALL_EMPTY_TRANSITION",
+                        "warning" if canonical_identity else "info",
+                        "high" if canonical_identity else "medium",
                         "attribute",
                         _node_path(node),
-                        "Identity属性が全空値になる境界を検出: " + down_stat.name,
+                        ("Canonical identity属性" if canonical_identity else "補助identity属性")
+                        + "が全空値になる境界を測定: " + down_stat.name,
                         {
                             "attribute": down_stat.name,
+                            "canonical_rbd_identity_attribute": canonical_identity,
+                            "canonical_name_nonempty_count_at_output": canonical_name_nonempty_count,
+                            "downstream_reference_to_this_attribute_not_measured": True,
+                            "causal_effect_not_established": True,
                             "input_node": upstream.node_path,
                             "input_owner": up_stat.owner,
                             "input_element_count": up_stat.count,
@@ -1762,7 +1851,7 @@ class HoudiniNetworkAnalyzer:
                             "values_measured_exactly": True,
                         },
                         "この属性を下流が使用する場合のみ、当該ノードの属性転送設定を確認してください。",
-                        ["cache", "glue", "apex_graph"],
+                        ["cache", "glue", "apex_graph"] if canonical_identity else ["cache", "apex_graph"],
                         [upstream.node_path],
                     )
 
@@ -1910,6 +1999,29 @@ class HoudiniNetworkAnalyzer:
     def _profile_enabled(self, profile: str) -> bool:
         return self.profile in ("auto", profile)
 
+    def _upstream_time_dependent_paths(self, node: Any, max_depth: int = 24) -> List[str]:
+        if node is None:
+            return []
+        found: List[str] = []
+        visited: Set[str] = set()
+        frontier = [node]
+        depth = 0
+        while frontier and depth <= max_depth and len(visited) < 1000:
+            next_frontier = []
+            for current in frontier:
+                current_path = _node_path(current)
+                if not current_path or current_path in visited:
+                    continue
+                visited.add(current_path)
+                if current_path in self.time_dependent_nodes:
+                    found.append(current_path)
+                next_frontier.extend(
+                    item for item in (_safe(lambda current=current: current.inputs(), ()) or ()) if item is not None
+                )
+            frontier = next_frontier
+            depth += 1
+        return sorted(set(found))
+
     def _diagnose_rbd_profiles(self) -> None:
         if not self._profile_enabled("rbd"):
             return
@@ -1917,6 +2029,8 @@ class HoudiniNetworkAnalyzer:
             text = _node_type_text(node)
             if "rbdbulletsolver" in text or ("rbd bullet solver" in text):
                 self._diagnose_rbd_solver(node)
+            elif self.scan_level != "fast" and "rbdconfigure" in text:
+                self._diagnose_rbd_configure_active_bounds(node)
             elif self.scan_level != "fast" and "rbdmaterialfracture" in text:
                 geometry = self._snapshot_node_output(node, 0)
                 constraints = self._snapshot_node_output(node, 1)
@@ -1932,6 +2046,70 @@ class HoudiniNetworkAnalyzer:
                 constraints = self._snapshot_input(node, 1)
                 proxy = self._snapshot_input(node, 2)
                 self._diagnose_rbd_contract(_node_path(node), geometry, constraints, proxy, "RBD Pack inputs")
+
+    def _diagnose_rbd_configure_active_bounds(self, node: Any) -> None:
+        """Measure how an RBD Configure Active/Use Bounds setup covers pieces."""
+        if not bool(self._parm_value(node, ("addactive1",), 0)):
+            return
+        if not bool(self._parm_value(node, ("useactivebounds1",), 0)):
+            return
+        configured_active = self._parm_value(node, ("active1",), None)
+        proxy = self._snapshot_node_output(node, 2)
+        if proxy is None:
+            return
+        active = proxy.stat("point", "active")
+        animated = proxy.stat("point", "animated")
+        if active is None or active.sampled <= 0:
+            return
+        piece_count = active.sampled
+        active_count = active.positive_count
+        animated_count = animated.positive_count if animated is not None else None
+        active_ratio = active_count / float(piece_count)
+        bounds_size = [
+            self._parm_value(node, ("bboxsizex",), None),
+            self._parm_value(node, ("bboxsizey",), None),
+            self._parm_value(node, ("bboxsizez",), None),
+        ]
+        bounds_center = [
+            self._parm_value(node, ("bboxcenterx",), None),
+            self._parm_value(node, ("bboxcentery",), None),
+            self._parm_value(node, ("bboxcenterz",), None),
+        ]
+        evidence = {
+            "context": "rbd_configure_active_use_bounds_output_proxy",
+            "output_index": 2,
+            "piece_count": piece_count,
+            "active_positive_count": active_count,
+            "active_ratio": active_ratio,
+            "animated_positive_count": animated_count,
+            "configured_active_value": configured_active,
+            "bounds_size": bounds_size,
+            "bounds_center": bounds_center,
+            "output_bbox_size": proxy.bbox.get("size"),
+            "values_measured_exactly": active.sampled == active.count,
+            "downstream_override_not_excluded": True,
+        }
+        self.add_check(
+            "RBD_CONFIGURE_ACTIVE_BOUNDS_COVERAGE",
+            "review",
+            "rbd",
+            _node_path(node),
+            evidence,
+            "Coverage measurement only; verify whether selected bounds represent the movable interior or the fixed frame.",
+        )
+        sparse_limit = max(3, int(piece_count * 0.01))
+        if configured_active is not None and float(configured_active) > 0 and active_count <= sparse_limit:
+            self.add_issue(
+                "RBD_CONFIGURE_ACTIVE_BOUNDS_SPARSE_COVERAGE",
+                "warning",
+                "high",
+                "rbd",
+                _node_path(node),
+                "RBD ConfigureのActive Boundsが動的Pieceをほとんど選択していません",
+                evidence,
+                "Sourceをスケール変更した場合は、Use BoundsのCenter/Sizeも現在のPacked Piece範囲に合わせてください。",
+                ["no_motion", "rbd_general"],
+            )
 
     def _diagnose_rbd_solver(self, solver: Any) -> None:
         path = _node_path(solver)
@@ -1981,6 +2159,7 @@ class HoudiniNetworkAnalyzer:
                 self._diagnose_rbd_piece_attributes(path, geometry, solver)
             if constraints is not None:
                 self._diagnose_constraint_geometry(path, constraints, geometry)
+                self._diagnose_rbd_impact_topology(path, constraints, geometry, solver)
             if collider is not None:
                 self._diagnose_external_collider(path, collider, solver)
             start_geometry = self._snapshot_input(solver, 0, frame=self.start_frame)
@@ -2055,6 +2234,8 @@ class HoudiniNetworkAnalyzer:
                 ["glue"],
             )
         self._diagnose_breaking_thresholds(solver)
+        if self.scan_level == "deep" and self.compare_frames:
+            self._diagnose_rbd_sim_response_samples(solver)
 
     def _name_stat(self, snapshot: Optional[GeometrySnapshot]) -> Optional[AttributeStats]:
         if snapshot is None:
@@ -2365,6 +2546,681 @@ class HoudiniNetworkAnalyzer:
                 {"context": context, "reason": "constraint_snapshot_unavailable"},
             )
 
+    def _constraint_geo_object(self, snapshot: GeometrySnapshot) -> Optional[Any]:
+        if hou is None:
+            return None
+        node = _safe(lambda: hou.node(snapshot.node_path), None)
+        if node is None:
+            return None
+        return _safe(lambda: node.geometry(snapshot.output_index), None)
+
+    def _numeric_primitive_summary(self, geometry: Any, prims: Sequence[Any], name: str) -> Dict[str, Any]:
+        attrib = _safe(lambda: geometry.findPrimAttrib(name), None)
+        if attrib is None:
+            return {"present": False, "count": len(prims)}
+        values: List[float] = []
+        for prim in prims:
+            value = _safe(lambda prim=prim: prim.attribValue(attrib), None)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+                values.append(float(value))
+        values.sort()
+        if not values:
+            return {"present": True, "count": len(prims), "numeric_count": 0}
+
+        def percentile(fraction: float) -> float:
+            return values[int((len(values) - 1) * fraction)]
+
+        unique_values = sorted(set(values))
+        result = {
+            "present": True,
+            "count": len(prims),
+            "numeric_count": len(values),
+            "minimum": values[0],
+            "p10": percentile(0.10),
+            "median": percentile(0.50),
+            "p90": percentile(0.90),
+            "maximum": values[-1],
+            "negative_count": sum(value < 0 for value in values),
+            "zero_count": sum(value == 0 for value in values),
+            "positive_count": sum(value > 0 for value in values),
+            "unique_value_sample": unique_values[:12],
+            "unique_value_count": len(unique_values),
+        }
+        if name == "strength":
+            finite_breakable = [value for value in values if value >= 0]
+            result.update(
+                {
+                    "negative_value_role": "unbreakable_sentinel",
+                    "negative_values_excluded_from_finite_strength_range": True,
+                    "finite_strength_count": len(finite_breakable),
+                    "finite_strength_minimum": min(finite_breakable) if finite_breakable else None,
+                    "finite_strength_median": finite_breakable[len(finite_breakable) // 2] if finite_breakable else None,
+                    "finite_strength_maximum": max(finite_breakable) if finite_breakable else None,
+                    "minimum_to_maximum_is_not_a_strength_spread_when_negative_values_exist": any(value < 0 for value in values),
+                }
+            )
+        return result
+
+    def _constraint_graph_summary(self, geometry: Any, prims: Sequence[Any]) -> Dict[str, Any]:
+        name_attrib = _safe(lambda: geometry.findPointAttrib("name"), None)
+        if name_attrib is None:
+            return {"measured": False, "reason": "point_name_missing", "primitive_count": len(prims)}
+        adjacency: Dict[str, Set[str]] = {}
+        line_count = 0
+        self_link_count = 0
+        for prim in prims:
+            points = list(_safe(lambda prim=prim: prim.points(), ()) or ())
+            if len(points) != 2:
+                continue
+            left = str(_safe(lambda: points[0].attribValue(name_attrib), "") or "")
+            right = str(_safe(lambda: points[1].attribValue(name_attrib), "") or "")
+            if not left or not right:
+                continue
+            line_count += 1
+            if left == right:
+                self_link_count += 1
+            adjacency.setdefault(left, set()).add(right)
+            adjacency.setdefault(right, set()).add(left)
+        visited: Set[str] = set()
+        sizes: List[int] = []
+        for start in adjacency:
+            if start in visited:
+                continue
+            component: Set[str] = set()
+            stack = [start]
+            while stack:
+                current = stack.pop()
+                if current in component:
+                    continue
+                component.add(current)
+                stack.extend(adjacency.get(current, set()) - component)
+            visited.update(component)
+            sizes.append(len(component))
+        degrees = sorted(len(neighbors) for neighbors in adjacency.values())
+        return {
+            "measured": True,
+            "line_count": line_count,
+            "named_node_count": len(adjacency),
+            "component_count": len(sizes),
+            "largest_component_size": max(sizes) if sizes else 0,
+            "component_size_sample_desc": sorted(sizes, reverse=True)[:12],
+            "degree_minimum": degrees[0] if degrees else 0,
+            "degree_median": degrees[len(degrees) // 2] if degrees else 0,
+            "degree_maximum": degrees[-1] if degrees else 0,
+            "self_link_count": self_link_count,
+        }
+
+    def _constraint_endpoint_name_set(self, geometry: Any) -> Tuple[Set[str], bool]:
+        """Return the exact constraint endpoint name set when point name is available."""
+        name_attrib = _safe(lambda: geometry.findPointAttrib("name"), None)
+        if name_attrib is None:
+            return set(), False
+        names: Set[str] = set()
+        for point in (_safe(lambda: geometry.points(), ()) or ()):
+            value = str(_safe(lambda point=point: point.attribValue(name_attrib), "") or "")
+            if value:
+                names.add(value)
+        return names, True
+
+    def _resolve_constraint_group(self, geometry: Any, expression: str) -> Tuple[List[Any], bool, str]:
+        all_prims = list(_safe(lambda: geometry.prims(), ()) or ())
+        if not expression.strip():
+            return all_prims, True, "all_primitives"
+        resolved = _safe(lambda: list(geometry.globPrims(expression)), None)
+        if resolved is not None:
+            return resolved, True, "hou.Geometry.globPrims"
+
+        # Fallback for the common `groupA ^groupB` form used by Bullet rules.
+        tokens = expression.split()
+        if not tokens:
+            return all_prims, True, "all_primitives"
+        current: Optional[Set[Any]] = None
+        exclude_next = False
+        for token in tokens:
+            if token == "^":
+                exclude_next = True
+                continue
+            exclude = token.startswith("^") or exclude_next
+            group_name = token[1:] if token.startswith("^") else token
+            group = _safe(lambda group_name=group_name: geometry.findPrimGroup(group_name), None)
+            if group is None:
+                return [], False, "unresolved_group_token:%s" % group_name
+            members = set(_safe(lambda group=group: group.prims(), ()) or ())
+            if current is None:
+                current = set(all_prims) if exclude else members
+            elif exclude:
+                current -= members
+            else:
+                current |= members
+            exclude_next = False
+        return list(current or set()), True, "simple_group_fallback"
+
+    def _constraint_selection_summary(self, geometry: Any, prims: Sequence[Any]) -> Dict[str, Any]:
+        return {
+            "primitive_count": len(prims),
+            "strength": self._numeric_primitive_summary(geometry, prims, "strength"),
+            "propagate_rate": self._numeric_primitive_summary(geometry, prims, "propagate_rate"),
+            "propagationiterations": self._numeric_primitive_summary(geometry, prims, "propagationiterations"),
+            "impulse_halflife": self._numeric_primitive_summary(geometry, prims, "impulse_halflife"),
+            "graph": self._constraint_graph_summary(geometry, prims),
+        }
+
+    def _diagnose_rbd_impact_topology(
+        self,
+        owner_path: str,
+        constraints: GeometrySnapshot,
+        geometry_snapshot: Optional[GeometrySnapshot],
+        solver: Any,
+    ) -> None:
+        geometry = self._constraint_geo_object(constraints)
+        if geometry is None:
+            return
+        all_prims = list(_safe(lambda: geometry.prims(), ()) or ())
+        constraint_name_attrib = _safe(lambda: geometry.findPrimAttrib("constraint_name"), None)
+        glue_prims = [
+            prim
+            for prim in all_prims
+            if constraint_name_attrib is not None
+            and str(_safe(lambda prim=prim: prim.attribValue(constraint_name_attrib), "") or "").lower() == "glue"
+        ]
+        all_graph = self._constraint_graph_summary(geometry, all_prims)
+        geometry_name_count = None
+        geometry_names: Set[str] = set()
+        geometry_names_measured_exactly = False
+        if geometry_snapshot is not None:
+            name_stat = self._name_stat(geometry_snapshot)
+            if name_stat is not None:
+                geometry_name_count = name_stat.unique_count
+                geometry_names_measured_exactly = name_stat.sampled == name_stat.count
+                if geometry_names_measured_exactly:
+                    geometry_names = {str(value) for value in name_stat.values if str(value)}
+        constraint_endpoint_names, endpoint_names_measured_exactly = self._constraint_endpoint_name_set(geometry)
+        geometry_without_constraint_endpoint: List[str] = []
+        if geometry_names_measured_exactly and endpoint_names_measured_exactly:
+            geometry_without_constraint_endpoint = sorted(geometry_names - constraint_endpoint_names)
+        self.add_check(
+            "RBD_CONSTRAINT_GRAPH_TOPOLOGY",
+            "review",
+            "rbd",
+            owner_path,
+            {
+                "context": "solver_input_constraint_graph",
+                "constraint_source": constraints.node_path,
+                "geometry_unique_name_count": geometry_name_count,
+                "geometry_and_endpoint_sets_measured_exactly": bool(
+                    geometry_names_measured_exactly and endpoint_names_measured_exactly
+                ),
+                "geometry_names_without_constraint_endpoint_count": (
+                    len(geometry_without_constraint_endpoint)
+                    if geometry_names_measured_exactly and endpoint_names_measured_exactly
+                    else None
+                ),
+                "geometry_names_without_constraint_endpoint_sample": geometry_without_constraint_endpoint[:12],
+                "single_component_required_by_contract": False,
+                "multiple_components_can_be_intentional_islands": True,
+                "unconstrained_geometry_can_be_intentional_projectile_or_frame": True,
+                "causal_effect_not_established": True,
+                **all_graph,
+            },
+            "Graph成分数は構造測定です。単一成分であることを要求する契約ではありません。",
+        )
+        self.add_check(
+            "RBD_GLUE_NUMERIC_DISTRIBUTION",
+            "review",
+            "rbd",
+            owner_path,
+            {
+                "context": "solver_input_glue_primitives",
+                "constraint_source": constraints.node_path,
+                "static_distribution_only": True,
+                "physical_cause_not_assigned": True,
+                "requires_dynamic_response_measurement_for_behavior_claim": True,
+                **self._constraint_selection_summary(geometry, glue_prims),
+            },
+            "Numeric distribution only; this check does not assign a physical cause.",
+        )
+
+        total_glue = len(glue_prims)
+        glue_set = set(glue_prims)
+        break_count = int(self._parm_value(solver, ("breaks",), 0) or 0)
+        for index in range(1, break_count + 1):
+            if not bool(self._parm_value(solver, ("constraint_useimpact%d" % index,), 0)):
+                continue
+            group_expression = self._parm_string(solver, ("constraint_group%d" % index,), "").strip()
+            constraint_names = self._parm_string(solver, ("constraint_names%d" % index,), "").strip()
+            selected, resolved, resolver = self._resolve_constraint_group(geometry, group_expression)
+            if constraint_names:
+                allowed_names = {token.casefold() for token in re.split(r"[\s,]+", constraint_names) if token}
+                selected = [
+                    prim
+                    for prim in selected
+                    if constraint_name_attrib is not None
+                    and str(_safe(lambda prim=prim: prim.attribValue(constraint_name_attrib), "") or "").casefold() in allowed_names
+                ]
+            selected_set = set(selected)
+            selected_glue = [prim for prim in selected if prim in glue_set]
+            outside_glue = [prim for prim in glue_prims if prim not in selected_set]
+            selected_summary = self._constraint_selection_summary(geometry, selected_glue)
+            outside_summary = self._constraint_selection_summary(geometry, outside_glue)
+            coverage = float(len(selected_glue)) / float(total_glue) if total_glue else None
+            threshold = self._parm_value(solver, ("constraint_impactthreshold%d" % index,), None)
+            evidence = {
+                "context": "impact_break_rule_%d" % index,
+                "rule_index": index,
+                "constraint_names": constraint_names,
+                "group_expression": group_expression,
+                "group_resolved": resolved,
+                "group_resolver": resolver,
+                "impact_threshold": threshold,
+                "total_glue_primitive_count": total_glue,
+                "selected_glue_primitive_count": len(selected_glue),
+                "outside_glue_primitive_count": len(outside_glue),
+                "selected_glue_ratio": coverage,
+                "selected": selected_summary,
+                "outside": outside_summary,
+            }
+            self.add_check(
+                "RBD_IMPACT_BREAK_RULE_SCOPE",
+                "review" if resolved else "not_checked",
+                "rbd",
+                owner_path,
+                evidence,
+                "Measured rule scope and attributes; response is not simulated by this check.",
+            )
+            rate = selected_summary.get("propagate_rate", {})
+            iterations = selected_summary.get("propagationiterations", {})
+            graph = selected_summary.get("graph", {})
+            localized_measurements = bool(
+                resolved
+                and selected_glue
+                and coverage is not None
+                and coverage < 0.60
+                and isinstance(rate.get("maximum"), (int, float))
+                and float(rate.get("maximum")) <= 0.05
+                and isinstance(iterations.get("maximum"), (int, float))
+                and float(iterations.get("maximum")) <= 3
+            )
+            if localized_measurements:
+                self.add_issue(
+                    "RBD_IMPACT_PROPAGATION_LOCALIZED",
+                    "warning",
+                    "high",
+                    "rbd",
+                    owner_path,
+                    "Impact破壊ルールの対象範囲と伝播値が局所的です",
+                    {
+                        "rule_index": index,
+                        "group_expression": group_expression,
+                        "selected_glue_primitive_count": len(selected_glue),
+                        "total_glue_primitive_count": total_glue,
+                        "selected_glue_ratio": coverage,
+                        "selected_graph_component_count": graph.get("component_count"),
+                        "selected_graph_largest_component_size": graph.get("largest_component_size"),
+                        "propagate_rate": rate,
+                        "propagationiterations": iterations,
+                        "outside_propagate_rate": outside_summary.get("propagate_rate", {}),
+                    },
+                    "衝撃が周辺へ伝わらない症状では、Impact対象Group、propagate_rate、propagationiterationsを確認してください。",
+                    ["glue", "localized_impact"],
+                )
+
+    def _diagnose_rbd_sim_response_samples(self, solver: Any) -> None:
+        path = _node_path(solver)
+        frames = sorted({float(value) for value in self.compare_frames})[:6]
+        samples: List[Dict[str, Any]] = []
+        collider_connection = next(
+            (
+                connection
+                for connection in (_safe(lambda: solver.inputConnections(), ()) or ())
+                if int(_safe(lambda connection=connection: connection.inputIndex(), -1)) == 3
+            ),
+            None,
+        )
+        collider_node = _safe(lambda: collider_connection.inputNode(), None) if collider_connection is not None else None
+        collider_output = int(_safe(lambda: collider_connection.outputIndex(), 0) or 0) if collider_connection is not None else 0
+
+        def percentile(values: Sequence[float], fraction: float) -> float:
+            if not values:
+                return 0.0
+            ordered = sorted(float(value) for value in values)
+            return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * fraction))]
+
+        for frame in frames:
+            try:
+                hou.setFrame(frame)
+                piece_geometry = solver.geometry(0)
+                constraint_geometry = solver.geometry(1)
+            except Exception as exc:
+                samples.append({"frame": frame, "measured": False, "error": "%s: %s" % (exc.__class__.__name__, exc)})
+                continue
+            velocity_attrib = _safe(lambda: piece_geometry.findPointAttrib("v"), None)
+            name_attrib = _safe(lambda: piece_geometry.findPointAttrib("name"), None)
+            active_attrib = _safe(lambda: piece_geometry.findPointAttrib("active"), None)
+            speeds: List[float] = []
+            active_speeds: List[float] = []
+            velocity_vectors: List[Tuple[float, float, float]] = []
+            moving_names: List[str] = []
+            active_count = 0
+            for point in list(_safe(lambda: piece_geometry.points(), ()) or ()):
+                velocity = _safe(lambda point=point: point.attribValue(velocity_attrib), (0.0, 0.0, 0.0)) if velocity_attrib is not None else (0.0, 0.0, 0.0)
+                velocity_tuple = tuple(float(value) for value in tuple(velocity)[:3])
+                speed = _vector_length(velocity) or 0.0
+                speeds.append(speed)
+                velocity_vectors.append(velocity_tuple)
+                if speed > 0.01 and name_attrib is not None and len(moving_names) < 20:
+                    moving_names.append(str(_safe(lambda point=point: point.attribValue(name_attrib), "") or ""))
+                if active_attrib is not None and bool(_safe(lambda point=point: point.attribValue(active_attrib), 0)):
+                    active_count += 1
+                    active_speeds.append(speed)
+            constraint_prims = list(_safe(lambda: constraint_geometry.prims(), ()) or ())
+            collider_positions: Dict[str, Tuple[float, float, float]] = {}
+            collider_explicit_speeds: List[float] = []
+            collider_speedmax_values: List[float] = []
+            if collider_node is not None:
+                collider_geometry = _safe(lambda: collider_node.geometryAtFrame(frame, collider_output), None)
+                if collider_geometry is not None:
+                    collider_name = _safe(lambda: collider_geometry.findPointAttrib("name"), None)
+                    collider_velocity = _safe(lambda: collider_geometry.findPointAttrib("v"), None)
+                    collider_speedmax = _safe(lambda: collider_geometry.findPointAttrib("speedmax"), None)
+                    for point_index, point in enumerate(list(_safe(lambda: collider_geometry.points(), ()) or ())):
+                        key = (
+                            str(_safe(lambda point=point: point.attribValue(collider_name), "") or "")
+                            if collider_name is not None
+                            else "@point%d" % point_index
+                        )
+                        if not key:
+                            key = "@point%d" % point_index
+                        collider_positions[key] = tuple(float(value) for value in tuple(point.position())[:3])
+                        explicit_velocity = (
+                            _safe(lambda point=point: point.attribValue(collider_velocity), (0.0, 0.0, 0.0))
+                            if collider_velocity is not None
+                            else (0.0, 0.0, 0.0)
+                        )
+                        collider_explicit_speeds.append(_vector_length(explicit_velocity) or 0.0)
+                        if collider_speedmax is not None:
+                            collider_speedmax_values.append(
+                                float(_safe(lambda point=point: point.attribValue(collider_speedmax), 0.0) or 0.0)
+                            )
+            samples.append(
+                {
+                    "frame": frame,
+                    "measured": True,
+                    "piece_count": len(speeds),
+                    "active_piece_count": active_count if active_attrib is not None else None,
+                    "moving_piece_count_speed_gt_0_01": sum(value > 0.01 for value in speeds),
+                    "moving_piece_count_speed_gt_0_1": sum(value > 0.1 for value in speeds),
+                    "maximum_speed": max(speeds) if speeds else None,
+                    "active_speed_p50": percentile(active_speeds, 0.50),
+                    "active_speed_p90": percentile(active_speeds, 0.90),
+                    "active_speed_p99": percentile(active_speeds, 0.99),
+                    "moving_fraction_of_active": (
+                        sum(value > 0.01 for value in active_speeds) / float(active_count)
+                        if active_count > 0
+                        else None
+                    ),
+                    "velocity_x_positive_count_speed_gt_0_01": sum(
+                        speed > 0.01 and velocity[0] > 0.01
+                        for speed, velocity in zip(speeds, velocity_vectors)
+                    ),
+                    "velocity_x_negative_count_speed_gt_0_01": sum(
+                        speed > 0.01 and velocity[0] < -0.01
+                        for speed, velocity in zip(speeds, velocity_vectors)
+                    ),
+                    "moving_name_sample": moving_names,
+                    "constraint_primitive_count": len(constraint_prims),
+                    "constraint_strength": self._numeric_primitive_summary(constraint_geometry, constraint_prims, "strength"),
+                    "constraint_graph": self._constraint_graph_summary(constraint_geometry, constraint_prims),
+                    "collider_explicit_v_present": bool(collider_explicit_speeds),
+                    "collider_explicit_v_nonzero_count": sum(value > 1e-5 for value in collider_explicit_speeds),
+                    "collider_explicit_v_maximum": max(collider_explicit_speeds) if collider_explicit_speeds else None,
+                    "collider_speedmax_attribute_minimum": min(collider_speedmax_values) if collider_speedmax_values else None,
+                    "collider_speedmax_attribute_maximum": max(collider_speedmax_values) if collider_speedmax_values else None,
+                    "_piece_velocity_vectors": velocity_vectors,
+                    "_collider_positions": collider_positions,
+                }
+            )
+        measured = [sample for sample in samples if sample.get("measured")]
+        collider_zero_v_motion: List[Dict[str, Any]] = []
+        opposite_motion_samples: List[Dict[str, Any]] = []
+        if measured:
+            baseline = measured[0]
+            base_constraints = int(baseline.get("constraint_primitive_count", 0) or 0)
+            for sample in measured:
+                sample["constraint_count_change_from_first_sample"] = int(sample.get("constraint_primitive_count", 0) or 0) - base_constraints
+            for previous, current in zip(measured[:-1], measured[1:]):
+                previous_positions = previous.get("_collider_positions") or {}
+                current_positions = current.get("_collider_positions") or {}
+                common_names = sorted(set(previous_positions) & set(current_positions))
+                frame_delta = float(current.get("frame", 0.0)) - float(previous.get("frame", 0.0))
+                seconds = frame_delta / float(_safe(lambda: hou.fps(), 24.0) or 24.0)
+                motions: List[Tuple[float, str, Tuple[float, float, float]]] = []
+                if seconds > 0:
+                    for name in common_names:
+                        vector = tuple(
+                            (float(current_positions[name][axis]) - float(previous_positions[name][axis])) / seconds
+                            for axis in range(3)
+                        )
+                        motions.append((_vector_length(vector) or 0.0, name, vector))
+                if not motions:
+                    continue
+                motions.sort(key=lambda item: item[0])
+                maximum_motion = motions[-1]
+                motion_record = {
+                    "from_frame": previous.get("frame"),
+                    "to_frame": current.get("frame"),
+                    "matched_point_count": len(motions),
+                    "implied_speed_p50": percentile([item[0] for item in motions], 0.50),
+                    "implied_speed_p90": percentile([item[0] for item in motions], 0.90),
+                    "implied_speed_maximum": maximum_motion[0],
+                    "fastest_point_name": maximum_motion[1],
+                    "fastest_point_velocity": list(maximum_motion[2]),
+                    "explicit_v_maximum_at_to_frame": current.get("collider_explicit_v_maximum"),
+                    "speedmax_attribute_maximum_at_to_frame": current.get("collider_speedmax_attribute_maximum"),
+                }
+                current["collider_position_motion_from_previous_sample"] = motion_record
+                if maximum_motion[0] > 0.1 and float(current.get("collider_explicit_v_maximum", 0.0) or 0.0) <= 1e-5:
+                    collider_zero_v_motion.append(motion_record)
+                driver_length = maximum_motion[0]
+                piece_vectors = current.get("_piece_velocity_vectors") or []
+                if driver_length > 1e-5 and piece_vectors:
+                    unit = tuple(value / driver_length for value in maximum_motion[2])
+                    aligned: List[float] = []
+                    opposite_speeds: List[float] = []
+                    for vector in piece_vectors:
+                        speed = _vector_length(vector) or 0.0
+                        if speed <= 0.01:
+                            continue
+                        dot = sum(vector[axis] * unit[axis] for axis in range(3))
+                        aligned.append(dot)
+                        if dot < -0.01:
+                            opposite_speeds.append(speed)
+                    alignment_record = {
+                        "driver_point_name": maximum_motion[1],
+                        "driver_velocity": list(maximum_motion[2]),
+                        "moving_piece_count": len(aligned),
+                        "along_driver_count": sum(value > 0.01 for value in aligned),
+                        "opposite_driver_count": sum(value < -0.01 for value in aligned),
+                        "opposite_driver_ratio": (
+                            sum(value < -0.01 for value in aligned) / float(len(aligned))
+                            if aligned
+                            else None
+                        ),
+                        "opposite_piece_speed_p90": percentile(opposite_speeds, 0.90),
+                    }
+                    current["piece_velocity_alignment_to_fastest_collider_point"] = alignment_record
+                    if (
+                        aligned
+                        and len(opposite_speeds) >= max(10, int(len(aligned) * 0.10))
+                        and percentile(opposite_speeds, 0.90) > 1.0
+                        and float(current.get("active_speed_p50", 0.0) or 0.0)
+                        / max(float(previous.get("active_speed_p50", 0.0) or 0.0), 0.01) >= 10.0
+                    ):
+                        opposite_motion_samples.append({"frame": current.get("frame"), **alignment_record})
+        for sample in samples:
+            sample.pop("_piece_velocity_vectors", None)
+            sample.pop("_collider_positions", None)
+        self.add_check(
+            "RBD_SIM_RESPONSE_SAMPLE",
+            "review" if measured else "not_checked",
+            "rbd",
+            path,
+            {
+                "context": "explicit_deep_compare_frames",
+                "samples": samples,
+                "frames_requested": frames,
+                "simulation_was_cooked": bool(measured),
+            },
+            "These are frame samples, not a causal interpretation.",
+        )
+        if collider_zero_v_motion:
+            self.add_issue(
+                "RBD_COLLIDER_POSITION_MOTION_WITH_ZERO_V",
+                "warning",
+                "high",
+                "rbd",
+                path,
+                "ColliderのP移動を測定しましたが明示vは0のままです",
+                {
+                    "observed_intervals": collider_zero_v_motion,
+                    "position_motion_and_explicit_v_measured": True,
+                    "solver_derived_motion_behavior_not_established": True,
+                },
+                "Input 4のAnimated/Deforming方式と速度生成を確認し、Speed Max属性だけでP移動が制限されたと仮定しないでください。",
+                ["violent_fragments", "tunneling", "collision_offset"],
+            )
+        if opposite_motion_samples:
+            self.add_issue(
+                "RBD_SIM_RESPONSE_OPPOSITE_COLLIDER_MOTION",
+                "warning",
+                "high",
+                "rbd",
+                path,
+                "Collider主要移動方向と逆向きのPiece速度を比較フレームで測定しました",
+                {
+                    "observed_samples": opposite_motion_samples,
+                    "contact_normal_and_causal_mechanism_not_measured": True,
+                },
+                "深いめり込み、固定境界からの反力、Bounce、Collider速度生成を分けて確認してください。",
+                ["violent_fragments"],
+            )
+        if len(measured) < 2:
+            return
+        future_samples = measured[1:]
+        if future_samples:
+            no_motion_samples = [
+                {
+                    "frame": sample.get("frame"),
+                    "piece_count": sample.get("piece_count"),
+                    "active_piece_count": sample.get("active_piece_count"),
+                    "moving_piece_count_speed_gt_0_01": sample.get("moving_piece_count_speed_gt_0_01"),
+                    "maximum_speed": sample.get("maximum_speed"),
+                    "constraint_primitive_count": sample.get("constraint_primitive_count"),
+                }
+                for sample in future_samples
+                if int(sample.get("moving_piece_count_speed_gt_0_01", 0) or 0) == 0
+                and float(sample.get("maximum_speed", 0.0) or 0.0) <= 0.01
+            ]
+            if len(no_motion_samples) == len(future_samples):
+                self.add_issue(
+                    "RBD_SIM_RESPONSE_NO_MOTION",
+                    "error",
+                    "high",
+                    "rbd",
+                    path,
+                    "比較した将来フレームで移動Pieceを検出できませんでした",
+                    {
+                        "first_sample_frame": measured[0].get("frame"),
+                        "observed_future_samples": no_motion_samples,
+                        "speed_threshold": 0.01,
+                        "simulation_was_cooked": True,
+                    },
+                    "Solver入力のactive/animated分布、RBD ConfigureのUse Bounds被覆、Colliderとの位置関係を確認してください。",
+                    ["no_motion", "rbd_general"],
+                )
+        widespread_speed_samples: List[Dict[str, Any]] = []
+        for previous, current in zip(measured[:-1], measured[1:]):
+            active_count = int(current.get("active_piece_count", 0) or 0)
+            moving_fraction = current.get("moving_fraction_of_active")
+            current_median = float(current.get("active_speed_p50", 0.0) or 0.0)
+            previous_median = float(previous.get("active_speed_p50", 0.0) or 0.0)
+            gain_ratio = current_median / max(previous_median, 0.01)
+            if (
+                active_count >= 20
+                and isinstance(moving_fraction, (int, float))
+                and float(moving_fraction) >= 0.80
+                and current_median > 5.0
+                and gain_ratio >= 10.0
+            ):
+                widespread_speed_samples.append(
+                    {
+                        "from_frame": previous.get("frame"),
+                        "frame": current.get("frame"),
+                        "piece_count": current.get("piece_count"),
+                        "active_piece_count": active_count,
+                        "moving_fraction_of_active": moving_fraction,
+                        "previous_active_speed_p50": previous_median,
+                        "active_speed_p50": current_median,
+                        "active_speed_p90": current.get("active_speed_p90"),
+                        "active_speed_p99": current.get("active_speed_p99"),
+                        "maximum_speed": current.get("maximum_speed"),
+                        "median_speed_gain_ratio": gain_ratio,
+                        "previous_constraint_count": previous.get("constraint_primitive_count"),
+                        "constraint_count": current.get("constraint_primitive_count"),
+                    }
+                )
+        if widespread_speed_samples:
+            self.add_issue(
+                "RBD_SIM_RESPONSE_WIDESPREAD_SPEED_SPIKE",
+                "warning",
+                "high",
+                "rbd",
+                path,
+                "多数のActive Pieceで急激な速度上昇を比較フレームから測定しました",
+                {
+                    "observed_samples": widespread_speed_samples,
+                    "absolute_speed_is_scene_scale_dependent": True,
+                    "causal_mechanism_not_established": True,
+                },
+                "Colliderのフレーム間P移動、明示v、めり込み、固定境界、Constraint解除タイミングを確認してください。",
+                ["violent_fragments"],
+            )
+        baseline_constraint_count = int(measured[0].get("constraint_primitive_count", 0) or 0)
+        localized_samples = []
+        for sample in measured[1:]:
+            piece_count = int(sample.get("piece_count", 0) or 0)
+            moving_count = int(sample.get("moving_piece_count_speed_gt_0_01", 0) or 0)
+            remaining_constraints = int(sample.get("constraint_primitive_count", 0) or 0)
+            graph = sample.get("constraint_graph") or {}
+            removed = baseline_constraint_count - remaining_constraints
+            largest = int(graph.get("largest_component_size", 0) or 0)
+            if removed > 0 and piece_count > 0 and moving_count <= max(10, int(piece_count * 0.05)) and largest >= int(piece_count * 0.90):
+                localized_samples.append(
+                    {
+                        "frame": sample.get("frame"),
+                        "constraints_removed_from_first_sample": removed,
+                        "moving_piece_count_speed_gt_0_01": moving_count,
+                        "piece_count": piece_count,
+                        "remaining_graph_component_count": graph.get("component_count"),
+                        "remaining_graph_largest_component_size": largest,
+                    }
+                )
+        if localized_samples:
+            self.add_issue(
+                "RBD_SIM_RESPONSE_FEW_MOVING_PIECES",
+                "warning",
+                "high",
+                "rbd",
+                path,
+                "比較フレームでConstraint減少に対して移動Piece数が少ない状態を測定しました",
+                {
+                    "first_sample_frame": measured[0].get("frame"),
+                    "first_sample_constraint_count": baseline_constraint_count,
+                    "observed_samples": localized_samples,
+                },
+                "Impact Groupと伝播属性、残存Constraint graphを確認してください。",
+                ["glue", "localized_impact"],
+            )
+
     def _diagnose_constraint_geometry(
         self,
         owner_path: str,
@@ -2391,6 +3247,30 @@ class HoudiniNetworkAnalyzer:
                 "constraint_name_present": constraint_name is not None,
                 "glue_observed_in_sample": glue_present,
                 "strength_present": strength is not None,
+            },
+        )
+        role_complete = constraints.primitive_role_sampled == primitive_count
+        two_point_lines = constraints.two_endpoint_open_line_count
+        role_ok = bool(
+            role_complete
+            and primitive_count > 0
+            and two_point_lines == primitive_count
+            and constraints.closed_polygon_primitive_count == 0
+        )
+        self.add_check(
+            "RBD_CONSTRAINT_GEOMETRY_ROLE",
+            "pass" if role_ok else "review",
+            "rbd",
+            owner_path,
+            {
+                "context": "constraint_geometry_role",
+                "constraint_source": constraints.node_path,
+                "primitive_count": primitive_count,
+                "two_endpoint_open_line_count": two_point_lines,
+                "open_polyline_count": constraints.open_polyline_primitive_count,
+                "closed_polygon_count": constraints.closed_polygon_primitive_count,
+                "role_sample_complete": role_complete,
+                "zero_surface_area_is_expected_for_open_lines": True,
             },
         )
         if primitive_count and len(constraints.primitive_pairs) < primitive_count * 0.9:
@@ -2541,17 +3421,43 @@ class HoudiniNetworkAnalyzer:
         orient = geometry.stat("point", "orient")
 
         if active is not None and active.positive_count == 0 and active.sampled:
-            self.add_issue(
-                "RBD_ALL_PIECES_INACTIVE",
-                "warning",
-                "medium",
+            source_node = _safe(lambda: hou.node(geometry.node_path), None) if hou is not None else None
+            upstream_time_paths = self._upstream_time_dependent_paths(source_node)
+            scan_is_start_frame = abs(float(geometry.frame) - float(self.start_frame)) < 1e-6
+            future_compare_frames = sorted(float(frame) for frame in self.compare_frames if float(frame) > float(geometry.frame))
+            active_evidence = {
+                "context": "solver_input_active_at_scan_frame",
+                "frame": geometry.frame,
+                "start_frame": self.start_frame,
+                "scan_is_start_frame": scan_is_start_frame,
+                "piece_count": active.sampled,
+                "active_positive_count": active.positive_count,
+                "upstream_time_dependent_count": len(upstream_time_paths),
+                "upstream_time_dependent_sample": upstream_time_paths[:12],
+                "future_compare_frames": future_compare_frames,
+                "future_activation_measured_by_this_check": False,
+                "causal_effect_on_impact_not_measured_by_this_check": True,
+            }
+            self.add_check(
+                "RBD_ACTIVE_STATE_AT_SCAN_FRAME",
+                "review",
                 "rbd",
                 owner_path,
-                "現在のSolver入力では全ピースがactive=0です",
-                {"frame": geometry.frame, "count": active.sampled},
-                "後続の時間依存active更新がある場合はSolverのOverwrite Attributesも確認してください。",
-                ["rbd_general", "glue"],
+                active_evidence,
+                "Single-frame state only; use Deep compare frames to measure later activation.",
             )
+            if not upstream_time_paths and not future_compare_frames:
+                self.add_issue(
+                    "RBD_ALL_PIECES_INACTIVE_WITHOUT_OBSERVED_UPDATE",
+                    "warning",
+                    "medium",
+                    "rbd",
+                    owner_path,
+                    "走査フレームで全ピースがactive=0で、上流の時間依存更新を確認できません",
+                    active_evidence,
+                    "別フレームでactiveを比較し、意図したHoldか未設定かを確認してください。",
+                    ["rbd_general", "glue"],
+                )
         if active is not None and animated is not None and active.sampled == animated.sampled:
             both = 0
             for left, right in zip(active.values, animated.values):
@@ -2577,19 +3483,22 @@ class HoudiniNetworkAnalyzer:
                 )
                 self.add_issue(
                     "RBD_VERY_LOW_FRICTION",
-                    "warning",
+                    "info",
                     "high",
                     "rbd",
                     owner_path,
-                    "friction値域が低摩擦ヒューリスティックに一致",
+                    "入力frictionが低摩擦ヒューリスティック範囲です",
                     {
                         "minimum": friction.minimum,
                         "maximum": friction.maximum,
                         "below_0_08_count": below_count,
                         "sampled_count": friction.sampled,
                         "sample_is_complete": friction.sampled == friction.count,
+                        "heuristic_only": True,
+                        "visual_problem_not_established": True,
+                        "causal_effect_not_established": True,
                     },
-                    "Solver既定値ではなく、入力Point Attributeの最終値を確認してください。",
+                    "滑りが症状として観測された場合だけ、入力Point Attributeの最終値と接触材質を確認してください。",
                     ["sliding"],
                 )
             solver_friction = self._parm_value(solver, ("friction",), None)
@@ -2710,6 +3619,9 @@ class HoudiniNetworkAnalyzer:
                 continue
             moving = sum(1 for value in stat.values if (_vector_length(value) or 0.0) > 1e-5)
             if moving:
+                sampled = max(1, stat.sampled)
+                sparse_limit = max(2, int(sampled * 0.001))
+                sparse_initial_motion = moving <= sparse_limit
                 moving_names: List[str] = []
                 if names is not None and len(names.values) == len(stat.values):
                     for piece_name, value in zip(names.values, stat.values):
@@ -2717,20 +3629,23 @@ class HoudiniNetworkAnalyzer:
                             moving_names.append(str(piece_name))
                 self.add_issue(
                     "RBD_NONZERO_INITIAL_" + name.upper(),
-                    "warning",
+                    "info" if sparse_initial_motion else "warning",
                     "high",
                     "rbd",
                     owner_path,
-                    "開始フレームの%s分布に非ゼロ要素があります" % name,
+                    "開始フレームで非ゼロ%sを測定" % name,
                     {
                         "frame": geometry.frame,
                         "moving_count": moving,
                         "sampled": stat.sampled,
+                        "moving_fraction": moving / float(sampled),
+                        "sparse_initial_motion": sparse_initial_motion,
                         "max_length": stat.vector_max_length,
                         "moving_name_sample": moving_names[:12],
                         "sample_is_complete": stat.sampled == stat.count,
+                        "causal_effect_not_established": True,
                     },
-                    "投射物・アニメーション由来の意図した初速か、静止ピースの残留値かをnameで分類してください。",
+                    "投射物など意図した初速かをnameで分類してください。多数の破片に分布する場合は残留値も確認してください。",
                     ["frame_one_explosion"],
                 )
 
@@ -2755,20 +3670,42 @@ class HoudiniNetworkAnalyzer:
                 "Collider側へSpeed Maxを設定し、必要に応じてSubstepsを増やしてください。",
                 ["tunneling", "violent_fragments"],
             )
-        deforming = collider.stat("point", "deforming")
-        animated = collider.stat("point", "animated")
+        deforming = collider.any_stat("deforming")
+        animated = collider.any_stat("animated")
         if deforming is None and animated is None:
-            self.add_issue(
-                "RBD_COLLIDER_MOTION_FLAGS_MISSING",
-                "notice",
-                "medium",
+            source_node = _safe(lambda: hou.node(collider.node_path), None) if hou is not None else None
+            upstream_time_paths = self._upstream_time_dependent_paths(source_node)
+            evidence = {
+                "context": "external_collider_motion_inputs",
+                "source": collider.node_path,
+                "motion_flag_attributes_present": False,
+                "upstream_time_dependent_count": len(upstream_time_paths),
+                "upstream_time_dependent_sample": upstream_time_paths[:12],
+                "upstream_time_dependency_present": bool(upstream_time_paths),
+                "collider_motion_state": "not_measured",
+                "missing_motion_flags_do_not_establish_static_collider": True,
+                "collision_response_not_measured_by_this_check": True,
+            }
+            self.add_check(
+                "RBD_COLLIDER_MOTION_INPUT_EVIDENCE",
+                "review",
                 "rbd",
                 owner_path,
-                "外部コライダーにanimated/deforming属性が見当たりません",
-                {"source": collider.node_path},
-                "静止Colliderなら問題ありません。変形キャラクターならRBD Configureを確認してください。",
-                ["tunneling", "collision_offset"],
+                evidence,
+                "Missing point/primitive flags alone does not establish that input 4 is static.",
             )
+            if not upstream_time_paths:
+                self.add_issue(
+                    "RBD_COLLIDER_MOTION_FLAGS_MISSING_WITHOUT_TIME_DEPENDENCY",
+                    "notice",
+                    "medium",
+                    "rbd",
+                    owner_path,
+                    "Colliderのmotion属性と上流時間依存を確認できません",
+                    evidence,
+                    "静止Colliderなら問題ありません。変形キャラクターなら入力4の時間変化を比較してください。",
+                    ["tunneling", "collision_offset"],
+                )
 
     def _diagnose_breaking_thresholds(self, solver: Any) -> None:
         path = _node_path(solver)
@@ -2779,17 +3716,43 @@ class HoudiniNetworkAnalyzer:
             constraint_name = self._parm_string(solver, ("constraint_names%d" % index,), "").strip()
             if use_at_frame and not group:
                 frame = self._parm_value(solver, ("constraint_atframe%d" % index,), None)
-                self.add_issue(
-                    "RBD_GLOBAL_AT_FRAME_BREAK",
-                    "warning",
-                    "high",
+                observed_frames = [self.original_frame] + list(self.compare_frames)
+                observed_max = max(observed_frames) if observed_frames else self.original_frame
+                within_observed_window = bool(isinstance(frame, (int, float)) and float(frame) <= float(observed_max))
+                event_reached_at_scan_frame = bool(
+                    isinstance(frame, (int, float)) and float(self.original_frame) >= float(frame)
+                )
+                schedule_evidence = {
+                    "context": "at_frame_break_schedule",
+                    "rule_index": index,
+                    "constraint_name": constraint_name,
+                    "at_frame": frame,
+                    "scan_frame": self.original_frame,
+                    "compare_frame_maximum": max(self.compare_frames) if self.compare_frames else None,
+                    "within_observed_frame_window": within_observed_window,
+                    "event_reached_at_scan_frame": event_reached_at_scan_frame,
+                    "rule_does_not_execute_before_at_frame": True,
+                }
+                self.add_check(
+                    "RBD_AT_FRAME_BREAK_SCHEDULE",
+                    "review",
                     "rbd",
                     path,
-                    "Breaking ThresholdがGroupなしで全Constraintを時刻破断します",
-                    {"rule_index": index, "constraint_name": constraint_name, "frame": frame},
-                    "局所破壊が必要ならGroupまたはImpact条件へ限定してください。",
-                    ["glue", "clock_driven_break"],
+                    schedule_evidence,
+                    "Schedule measurement only; a future At Frame event does not execute at the scan frame.",
                 )
+                if within_observed_window:
+                    self.add_issue(
+                        "RBD_GLOBAL_AT_FRAME_BREAK_WITHIN_OBSERVED_WINDOW",
+                        "warning",
+                        "high",
+                        "rbd",
+                        path,
+                        "観測フレーム範囲内にGroup未指定のAt Frame破壊があります",
+                        schedule_evidence,
+                        "意図した全体解除か、局所Groupが必要かを確認してください。",
+                        ["glue", "clock_driven_break"],
+                    )
             use_impact = bool(self._parm_value(solver, ("constraint_useimpact%d" % index,), 0))
             threshold = self._parm_value(solver, ("constraint_impactthreshold%d" % index,), None)
             if use_impact and isinstance(threshold, (int, float)) and threshold <= 0:
@@ -3404,6 +4367,28 @@ class HoudiniNetworkAnalyzer:
                         "MotionClip Create/Configure Clip Infoの接続を確認してください。",
                     )
 
+    def _cache_active_load_path(self, node: Any) -> Tuple[str, str, Dict[str, Any]]:
+        """Return the path actually used by the cache's current file mode."""
+        file_method_parm = self._parm(node, "filemethod")
+        sop_output_parm = self._parm(node, "sopoutput")
+        if file_method_parm is not None and sop_output_parm is not None:
+            file_method_value = _safe(lambda: file_method_parm.eval(), None)
+            file_method_token = str(_safe(lambda: file_method_parm.evalAsString(), file_method_value) or file_method_value)
+            path = str(_safe(lambda: sop_output_parm.evalAsString(), "") or "")
+            return path, "sopoutput", {
+                "file_method_value": file_method_value,
+                "file_method_token": file_method_token,
+                "file_method_interpreted_by_sopoutput_expression": True,
+            }
+        for parm_name in ("sopoutput", "file", "file1", "outputfile", "filepath", "cachefile"):
+            parm = self._parm(node, parm_name)
+            if parm is None:
+                continue
+            path = str(_safe(lambda parm=parm: parm.evalAsString(), "") or "")
+            if path:
+                return path, parm_name, {}
+        return "", "", {}
+
     def _diagnose_cache_boundaries(self) -> None:
         for node in self.nodes:
             if not _is_cache_node(node):
@@ -3414,14 +4399,27 @@ class HoudiniNetworkAnalyzer:
                 ("loadfromdisk", "loadfromdisk0", "load", "reload"),
                 None,
             )
-            file_path = self._parm_string(
-                node,
-                ("file", "file1", "sopoutput", "outputfile", "filepath", "cachefile"),
-                "",
-            )
+            file_path, active_path_parameter, cache_mode = self._cache_active_load_path(node)
             if load_from_disk and file_path:
                 expanded = str(_safe(lambda: hou.expandString(file_path), file_path))
-                if not FRAME_TOKEN_RE.search(expanded) and not os.path.exists(os.path.normpath(expanded)):
+                path_exists = os.path.exists(os.path.normpath(expanded))
+                missing_frame_mode = self._parm_value(node, ("missingframe",), None)
+                self.add_check(
+                    "CACHE_ACTIVE_LOAD_TARGET",
+                    "pass" if path_exists else "review",
+                    "cache",
+                    path,
+                    {
+                        "context": "active_load_target",
+                        "load_from_disk": True,
+                        "active_path_parameter": active_path_parameter,
+                        "active_path": expanded,
+                        "active_path_exists_at_scan_frame": path_exists,
+                        "missing_frame_mode": missing_frame_mode,
+                        **cache_mode,
+                    },
+                )
+                if not FRAME_TOKEN_RE.search(expanded) and not path_exists:
                     self.add_issue(
                         "CACHE_LOAD_FILE_MISSING",
                         "error",
@@ -3429,7 +4427,12 @@ class HoudiniNetworkAnalyzer:
                         "cache",
                         path,
                         "Load from Diskが有効ですがCacheファイルがありません",
-                        {"path": expanded},
+                        {
+                            "path": expanded,
+                            "active_path_parameter": active_path_parameter,
+                            "missing_frame_mode": missing_frame_mode,
+                            **cache_mode,
+                        },
                         "Cacheを作成するか、Load from Diskとファイル名を確認してください。",
                         ["cache"],
                     )
@@ -3665,14 +4668,243 @@ def render_markdown(report: Dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+LLM_REVIEW_CHECK_SYMPTOMS = {
+    "RBD_ACTIVE_STATE_AT_SCAN_FRAME": {"rbd_general", "frame_one_explosion", "no_motion"},
+    "RBD_AT_FRAME_BREAK_SCHEDULE": {"glue", "clock_driven_break"},
+    "RBD_COLLIDER_MOTION_INPUT_EVIDENCE": {"tunneling", "collision_offset", "violent_fragments"},
+    "RBD_CONFIGURE_ACTIVE_BOUNDS_COVERAGE": {"rbd_general", "no_motion"},
+    "RBD_CONSTRAINT_GRAPH_TOPOLOGY": {"rbd_general", "glue"},
+    "RBD_GLUE_NUMERIC_DISTRIBUTION": {"glue", "localized_impact"},
+    "RBD_IMPACT_BREAK_RULE_SCOPE": {"glue", "localized_impact"},
+    "RBD_SIM_RESPONSE_SAMPLE": {"glue", "localized_impact", "violent_fragments"},
+    "CACHE_ACTIVE_LOAD_TARGET": {"cache", "frame_one_explosion"},
+}
+
+
+# These records are useful measurements in a complete report, but do not state
+# a violated contract.  Auto briefs omit them to reduce anchoring in small LLMs.
+LLM_AUTO_SUPPRESSED_REVIEW_CHECKS = {
+    "RBD_ACTIVE_STATE_AT_SCAN_FRAME",
+    "RBD_AT_FRAME_BREAK_SCHEDULE",
+    "RBD_COLLIDER_MOTION_INPUT_EVIDENCE",
+    "RBD_CONFIGURE_ACTIVE_BOUNDS_COVERAGE",
+    "RBD_CONSTRAINT_GRAPH_TOPOLOGY",
+    "RBD_GLUE_NUMERIC_DISTRIBUTION",
+}
+
+
+def _select_llm_checks(
+    checks: Sequence[Dict[str, Any]],
+    limit: int = 20,
+    symptom: str = "auto",
+) -> List[Dict[str, Any]]:
+    check_order = {"fail": 0, "review": 1, "pass": 2, "not_checked": 3}
+    ordered = sorted(
+        checks,
+        key=lambda item: (
+            check_order.get(str(item.get("status", "")), 9),
+            item.get("check_id", ""),
+            item.get("node_path", ""),
+        ),
+    )
+    selected: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    # Preserve variety before repeated checks from several RBD contract nodes.
+    for check in ordered:
+        check_id = str(check.get("check_id", ""))
+        status = str(check.get("status", ""))
+        if symptom == "auto" and check_id in LLM_AUTO_SUPPRESSED_REVIEW_CHECKS:
+            continue
+        if symptom != "auto" and status in ("review", "not_checked"):
+            relevant_symptoms = LLM_REVIEW_CHECK_SYMPTOMS.get(check_id, set())
+            if symptom not in relevant_symptoms:
+                continue
+        if check_id in seen_ids:
+            continue
+        selected.append(check)
+        seen_ids.add(check_id)
+        if len(selected) >= limit:
+            return selected
+    return selected
+
+
+def _llm_issue_matches_symptom(issue: Dict[str, Any], symptom: str) -> bool:
+    if symptom == "auto":
+        return str(issue.get("severity", "")) != "info"
+    if str(issue.get("llm_state", "review")) == "fail":
+        return True
+    if symptom in (issue.get("symptoms") or []):
+        return True
+    return bool(
+        issue.get("severity") in ("critical", "error")
+        and issue.get("confidence") == "high"
+    )
+
+
+def _compact_numeric_measurement(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    keep = (
+        "present", "count", "numeric_count", "minimum", "median", "maximum",
+        "negative_count", "zero_count", "positive_count", "unique_value_sample",
+        "negative_value_role", "negative_values_excluded_from_finite_strength_range",
+        "finite_strength_count", "finite_strength_minimum", "finite_strength_median",
+        "finite_strength_maximum", "minimum_to_maximum_is_not_a_strength_spread_when_negative_values_exist",
+    )
+    return {key: value[key] for key in keep if key in value}
+
+
+def _llm_check_evidence(check: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = dict(check.get("evidence") or {})
+    check_id = str(check.get("check_id", ""))
+    if check_id == "RBD_CONSTRAINT_GRAPH_TOPOLOGY":
+        return {
+            key: evidence.get(key)
+            for key in (
+                "context", "constraint_source", "geometry_unique_name_count",
+                "named_node_count", "line_count", "component_count", "largest_component_size",
+                "self_link_count", "geometry_and_endpoint_sets_measured_exactly",
+                "geometry_names_without_constraint_endpoint_count",
+                "geometry_names_without_constraint_endpoint_sample",
+                "single_component_required_by_contract",
+                "multiple_components_can_be_intentional_islands",
+                "unconstrained_geometry_can_be_intentional_projectile_or_frame",
+                "causal_effect_not_established",
+            )
+            if key in evidence
+        }
+    if check_id == "RBD_GLUE_NUMERIC_DISTRIBUTION":
+        result = {
+            key: evidence.get(key)
+            for key in (
+                "context", "constraint_source", "primitive_count", "static_distribution_only",
+                "physical_cause_not_assigned", "requires_dynamic_response_measurement_for_behavior_claim",
+            )
+            if key in evidence
+        }
+        for key in ("strength", "propagate_rate", "propagationiterations", "impulse_halflife"):
+            if key in evidence:
+                result[key] = _compact_numeric_measurement(evidence[key])
+        graph = evidence.get("graph") or {}
+        result["graph"] = {
+            key: graph.get(key)
+            for key in ("named_node_count", "line_count", "component_count", "largest_component_size")
+            if key in graph
+        }
+        return result
+    if check_id == "RBD_IMPACT_BREAK_RULE_SCOPE":
+        result = {
+            key: evidence.get(key)
+            for key in (
+                "context", "rule_index", "constraint_names", "group_expression", "group_resolved",
+                "group_resolver", "impact_threshold", "total_glue_primitive_count",
+                "selected_glue_primitive_count", "outside_glue_primitive_count", "selected_glue_ratio",
+            )
+            if key in evidence
+        }
+        for side in ("selected", "outside"):
+            source = evidence.get(side) or {}
+            compact_side: Dict[str, Any] = {"primitive_count": source.get("primitive_count")}
+            for key in ("strength", "propagate_rate", "propagationiterations"):
+                if key in source:
+                    compact_side[key] = _compact_numeric_measurement(source[key])
+            graph = source.get("graph") or {}
+            compact_side["graph"] = {
+                key: graph.get(key)
+                for key in ("named_node_count", "line_count", "component_count", "largest_component_size")
+                if key in graph
+            }
+            result[side] = compact_side
+        return result
+    if check_id == "RBD_SIM_RESPONSE_SAMPLE":
+        compact_samples = []
+        for sample in evidence.get("samples") or []:
+            compact_sample = {
+                key: sample.get(key)
+                for key in (
+                    "frame", "measured", "piece_count", "active_piece_count",
+                    "moving_piece_count_speed_gt_0_01", "moving_piece_count_speed_gt_0_1",
+                    "maximum_speed", "active_speed_p50", "active_speed_p90", "active_speed_p99",
+                    "moving_fraction_of_active", "velocity_x_positive_count_speed_gt_0_01",
+                    "velocity_x_negative_count_speed_gt_0_01", "moving_name_sample", "constraint_primitive_count",
+                    "constraint_count_change_from_first_sample", "error",
+                    "collider_explicit_v_present", "collider_explicit_v_nonzero_count",
+                    "collider_explicit_v_maximum", "collider_position_motion_from_previous_sample",
+                    "collider_speedmax_attribute_minimum", "collider_speedmax_attribute_maximum",
+                    "piece_velocity_alignment_to_fastest_collider_point",
+                )
+                if key in sample
+            }
+            if "constraint_strength" in sample:
+                compact_sample["constraint_strength"] = _compact_numeric_measurement(sample["constraint_strength"])
+            graph = sample.get("constraint_graph") or {}
+            compact_sample["constraint_graph"] = {
+                key: graph.get(key)
+                for key in ("component_count", "largest_component_size", "named_node_count")
+                if key in graph
+            }
+            compact_samples.append(compact_sample)
+        return {
+            "context": evidence.get("context"),
+            "frames_requested": evidence.get("frames_requested"),
+            "simulation_was_cooked": evidence.get("simulation_was_cooked"),
+            "samples": compact_samples,
+        }
+    return evidence
+
+
+def _aggregate_llm_issues(issues: Sequence[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
+    order: List[Tuple[str, str, str, str]] = []
+    for issue in issues:
+        evidence_key = json.dumps(_compact_llm_value(issue.get("evidence") or {}), ensure_ascii=False, sort_keys=True)
+        key = (
+            str(issue.get("rule_id", "")),
+            str(issue.get("severity", "")),
+            str(issue.get("confidence", "")),
+            evidence_key,
+        )
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(issue)
+
+    result: List[Dict[str, Any]] = []
+    for key in order:
+        members = grouped[key]
+        record = dict(members[0])
+        if len(members) > 1:
+            nodes = []
+            for member in members:
+                node_path = str(member.get("node_path", "") or "")
+                if node_path and node_path not in nodes:
+                    nodes.append(node_path)
+            evidence = dict(record.get("evidence") or {})
+            evidence["same_observation_occurrence_count"] = len(members)
+            evidence["node_sample"] = nodes[:12]
+            record["evidence"] = evidence
+            record["related_nodes"] = nodes[1:12]
+        result.append(record)
+        if len(result) >= max(1, limit):
+            break
+    return result
+
+
 def render_llm_brief(report: Dict[str, Any], limit: int = 20) -> str:
     summary = report.get("summary", {})
     scene = report.get("scene", {})
     options = report.get("options", {})
-    issues = list(report.get("issues", []))[: max(1, limit)]
-    checks = list(report.get("checks", []))
-    check_order = {"fail": 0, "review": 1, "pass": 2, "not_checked": 3}
-    checks.sort(key=lambda item: (check_order.get(str(item.get("status", "")), 9), item.get("check_id", ""), item.get("node_path", "")))
+    symptom = str(options.get("symptom", "auto") or "auto")
+    all_issues = list(report.get("issues", []))
+    scoped_issues = [issue for issue in all_issues if _llm_issue_matches_symptom(issue, symptom)]
+    issues = _aggregate_llm_issues(scoped_issues, max(1, limit))
+    all_checks = list(report.get("checks", []))
+    checks = _select_llm_checks(all_checks, 20, symptom=symptom)
+    dynamic_response_measured = any(
+        str(check.get("check_id", "")) == "RBD_SIM_RESPONSE_SAMPLE"
+        and bool((check.get("evidence") or {}).get("simulation_was_cooked"))
+        for check in all_checks
+    )
     lines = [
         "# Houdini Preflight Evidence Packet",
         "",
@@ -3682,6 +4914,16 @@ def render_llm_brief(report: Dict[str, Any], limit: int = 20) -> str:
         "- `tool_label`と`next_check`はヒューリスティックであり、原因や不具合の確定ではない。",
         "- `PASS`は記載された契約だけの合格、`FAIL`は明示契約違反、`REVIEW`は未確定候補、`NOT_CHECKED`は証拠不足を表す。",
         "- 要素数・Class・分布の入出力差だけから、属性消失・破損・因果関係を推定しない。identity集合差や契約FAILを優先する。",
+        "- 数値分布・Group被覆率・Graph成分数は測定値であり、それ単独では物理挙動の原因を確定しない。",
+        "- 静的Glue分布は意図した島構造でも現れる。見た目の硬さ・波及不足はCompare Framesの動的応答測定を優先する。",
+        "- `確認済み`に因果的な「影響」を書かない。因果は明示的な複数フレーム応答測定がなければ`候補`に置く。",
+        "- Glue strength=-1は破断不能Sentinelであり、有限値との大小差として扱わない。有限strengthの絶対的な強弱はScale・Mass・Impactとの比較なしに断定しない。",
+        "- 走査フレームのstrength=-1だけでは将来フレームのロックを確定しない。At Frame・上流更新・Solver内削除後のConstraint数を測定する。",
+        "- 1フレームのactive=0、補助identity空値、motion flag不在、未来のAt Frameだけから、未Activation・ID破損・静止Collider・現在のGlue維持を推定しない。",
+        "- Dynamic solver response measured=falseなら、全体飛散・逆向き速度・無動作など時間応答の有無をこのPacketから判断しない。",
+        "- 2点の開いたPolylineはConstraint/Curveとして扱う。面積0を縮退Surfaceと解釈しない。",
+        "- ノード名・HIP名・コメントは文脈メタデータであり、測定事実ではない。",
+        "- 症状指定時、このPacketは無関係なREVIEWを省略する。省略分は完全JSONレポートに残る。",
         "- 最終回答を `確認済み / 候補 / 不明` に分け、証拠のない断定をしない。",
         "",
         "## Scan Context",
@@ -3690,17 +4932,19 @@ def render_llm_brief(report: Dict[str, Any], limit: int = 20) -> str:
         "- Frame: `%s`" % scene.get("frame", ""),
         "- Profile / scan: `%s / %s`" % (options.get("profile", ""), options.get("scan_level", "")),
         "- Scope node count: %s" % summary.get("node_count", 0),
-        "- Contract checks: %s" % summary.get("check_count", len(checks)),
+        "- Contract checks: %s (packet representatives: %s)" % (summary.get("check_count", len(all_checks)), len(checks)),
         "- Review records: %s" % summary.get("issue_count", 0),
+        "- Symptom-focused review records shown: %s / %s" % (len(issues), len(all_issues)),
+        "- Dynamic solver response measured: %s" % ("true" if dynamic_response_measured else "false"),
         "",
         "## Contract Checks",
         "",
     ]
     if not checks:
         lines.append("- status=NOT_CHECKED check_id=NO_EXPLICIT_CONTRACT_CHECKS")
-    for check in checks[:16]:
+    for check in checks:
         evidence = json.dumps(
-            _compact_llm_value(check.get("evidence") or {}),
+            _compact_llm_value(_llm_check_evidence(check)),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -3768,7 +5012,7 @@ def render_llm_brief(report: Dict[str, Any], limit: int = 20) -> str:
             outputs = record.get("outputs", [])
             if outputs:
                 lines.append("  - Outputs: " + "; ".join(outputs[:8]))
-    lines.extend(["", "## Requested judgement format", "", "1. 確認済み: PASS/FAILとobservedで直接支持される内容", "2. 候補: REVIEWから考えられる内容。反証候補も併記", "3. 不明: このpacketだけでは決められない内容", "4. 次に確認するノードと属性を最大5件"])
+    lines.extend(["", "## Requested judgement format", "", "1. 確認済み: PASS/FAILとobservedで直接支持される測定状態のみ。因果的な影響を書かない", "2. 候補: REVIEWから考えられる因果候補。反証候補も併記", "3. 不明: このpacketだけでは決められない内容", "4. 次に確認するノードと属性を最大5件"])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -3873,8 +5117,8 @@ class HoudiniPreflightDialog:
 
         intro = QtWidgets.QLabel(
             "ドラッグ選択したノードを、ルールベースで事前解析します。"
-            " RBDはGeometry/Constraint/Proxy、APEX/KineFXはGraph/Port/Joint/Transform/Captureを重点検査します。"
-            " LLM向け出力はPASS/FAIL/REVIEWと実測値を分離します。自動修正やシーン保存は行いません。"
+            "RBDはGeometry/Constraint/Proxy、APEX/KineFXはGraph/Port/Joint/Transform/Captureを重点検査します。"
+            "出力ではPASS/FAIL/REVIEWと実測値を分離します。"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -3913,10 +5157,12 @@ class HoudiniPreflightDialog:
         self.symptom_combo = QtWidgets.QComboBox()
         for label, value in (
             ("症状指定なし", "auto"),
+            ("全く動かない", "no_motion"),
             ("開始直後に爆散", "frame_one_explosion"),
             ("高速物体がすり抜ける", "tunneling"),
             ("滑りすぎる", "sliding"),
             ("Glue / Clusterがおかしい", "glue"),
+            ("衝撃が周囲へ伝わらない", "localized_impact"),
             ("破片が激しく飛びすぎる", "violent_fragments"),
             ("Cache後に挙動が変わる", "cache"),
             ("処理が重い", "performance"),
