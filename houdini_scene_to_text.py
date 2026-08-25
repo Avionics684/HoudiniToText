@@ -7,13 +7,16 @@ exporter uses the standard library and hou; the optional UI uses PySide.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as _datetime
 import hashlib
+import inspect
 import json
 import os
 import re
 import sys
 import traceback
+import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -22,7 +25,7 @@ except ImportError:  # Allows syntax checks outside Houdini.
     hou = None  # type: ignore
 
 
-SCHEMA_VERSION = "1.17.3"
+SCHEMA_VERSION = "1.19.0"
 EXPORTER_NAME = "houdini_scene_to_text"
 DEFAULT_MAX_TEXT_CHARS = 200_000
 DEFAULT_GEOMETRY_SAMPLE_COUNT = 0
@@ -33,6 +36,11 @@ DEFAULT_EVALUATE_PARAMETERS = True
 DEFAULT_INCLUDE_PACKED_RIG_TREES = True
 DEFAULT_INCLUDE_BYPASSED_NODES = False
 DEFAULT_INCLUDE_SCENE_PATHS = False
+DEFAULT_INCLUDE_TOP_SUMMARY = False
+DEFAULT_TOP_WORK_ITEM_LIMIT = 32
+DEFAULT_TOP_ATTRIBUTE_LIMIT = 24
+DEFAULT_TOP_FILE_LIMIT = 8
+DEFAULT_TOP_LOG_CHARS = 12_000
 EXPORT_FRESHNESS_NOTICE_JA = "ファイルキャッシュなどは毎回きちんと更新しています。"
 PARAMETER_SILENT_NODE_TYPES = {"null", "merge"}
 WRANGLE_RUN_OVER_BY_INDEX = {
@@ -141,6 +149,38 @@ def _enum_to_string(value: Any) -> Optional[str]:
     except Exception:
         pass
     return str(value)
+
+
+def _enum_short_token(value: Any) -> Optional[str]:
+    text = _enum_to_string(value)
+    if text is None:
+        return None
+    return str(text).rsplit(".", 1)[-1]
+
+
+def _top_state_sort_key(state: Any) -> int:
+    token = str(state or "").lower()
+    order = (
+        "cookedfail",
+        "cookedcancel",
+        "cooking",
+        "scheduled",
+        "waiting",
+        "dirty",
+        "uncooked",
+        "cookedsuccess",
+        "cookedcache",
+        "undefined",
+    )
+    try:
+        return order.index(token)
+    except ValueError:
+        return len(order)
+
+
+def _top_state_is_problem(state: Any) -> bool:
+    token = str(state or "").lower()
+    return "fail" in token or "cancel" in token or "error" in token
 
 
 def _method(obj: Any, name: str) -> Optional[Callable[..., Any]]:
@@ -417,6 +457,8 @@ class HoudiniSceneExporter:
         include_bypassed_nodes: bool = DEFAULT_INCLUDE_BYPASSED_NODES,
         include_scene_paths: bool = DEFAULT_INCLUDE_SCENE_PATHS,
         include_network_items: bool = False,
+        include_top_summary: bool = DEFAULT_INCLUDE_TOP_SUMMARY,
+        top_work_item_limit: int = DEFAULT_TOP_WORK_ITEM_LIMIT,
         temporary_frame: Optional[float] = None,
     ) -> None:
         self.root_paths = list(root_paths or ["/"])
@@ -439,6 +481,8 @@ class HoudiniSceneExporter:
         self.include_bypassed_nodes = include_bypassed_nodes
         self.include_scene_paths = include_scene_paths
         self.include_network_items = include_network_items
+        self.include_top_summary = include_top_summary
+        self.top_work_item_limit = max(0, int(top_work_item_limit))
         self.temporary_frame = temporary_frame
         self.errors: List[Dict[str, Any]] = []
         self._connection_keys: set = set()
@@ -538,6 +582,8 @@ class HoudiniSceneExporter:
                 "include_bypassed_nodes": self.include_bypassed_nodes,
                 "include_scene_paths": self.include_scene_paths,
                 "include_network_items": self.include_network_items,
+                "include_top_summary": self.include_top_summary,
+                "top_work_item_limit": self.top_work_item_limit,
                 "temporary_frame": self.temporary_frame,
             },
             "counts": {
@@ -549,6 +595,7 @@ class HoudiniSceneExporter:
                 "code_blocks": len(code_blocks),
                 "hda_definitions": len(self._hda_definitions),
                 "packed_rig_trees": sum(1 for record in node_records if record.get("packed_rig_tree")),
+                "top_snapshots": sum(1 for record in node_records if record.get("top_summary")),
                 "bypassed_nodes_skipped": len(skipped_bypassed_paths),
                 "errors": len(self.errors),
             },
@@ -591,6 +638,14 @@ class HoudiniSceneExporter:
             return default
         try:
             return method(*args)
+        except Exception:
+            return default
+
+    def _try_attr(self, obj: Any, name: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        try:
+            return getattr(obj, name)
         except Exception:
             return default
 
@@ -1051,7 +1106,368 @@ class HoudiniSceneExporter:
             packed_rig_tree = self._packed_rig_tree(node)
             if packed_rig_tree is not None:
                 record["packed_rig_tree"] = packed_rig_tree
+        if self.include_top_summary and self._node_is_top_node(node):
+            record["top_summary"] = self._top_summary(node)
         return record
+
+    def _node_is_top_node(self, node: Any) -> bool:
+        if node is None:
+            return False
+        if node.__class__.__name__ == "TopNode":
+            return True
+        node_type = self._try_method(node, "type", None)
+        category = self._try_method(node_type, "category", None)
+        category_name = str(self._try_method(category, "name", "") or "").lower()
+        return category_name in ("top", "tops")
+
+    def _top_summary(self, node: Any) -> Dict[str, Any]:
+        """Read the current PDG snapshot without generating or cooking work items."""
+        cook_state = _enum_short_token(self._try_method(node, "getCookState", None, False))
+        record: Dict[str, Any] = {
+            "snapshot_only": True,
+            "cook_triggered_by_exporter": False,
+            "cook_state": cook_state,
+            "classification": {
+                "scheduler": self._try_method(node, "isScheduler", None),
+                "processor": self._try_method(node, "isProcessor", None),
+                "partitioner": self._try_method(node, "isPartitioner", None),
+                "mapper": self._try_method(node, "isMapper", None),
+            },
+            "input_data_types": _as_plain(self._try_method(node, "inputDataTypes", ()), self.max_text_chars),
+            "output_data_types": _as_plain(self._try_method(node, "outputDataTypes", ()), self.max_text_chars),
+            "selected_work_item_id": self._try_method(node, "getSelectedWorkItem", None),
+        }
+        pdg_node = self._try_method(node, "getPDGNode", None)
+        if pdg_node is None:
+            record["pdg_node_available"] = False
+            record["availability_note"] = (
+                "The underlying PDG node has not been generated in this Houdini session. "
+                "The exporter did not start a cook or static generation."
+            )
+            return record
+
+        record["pdg_node_available"] = True
+        record["pdg_node"] = self._top_pdg_node_record(pdg_node)
+        work_items = self._top_all_work_items(pdg_node)
+        state_counts = collections.Counter(
+            _enum_short_token(self._try_attr(item, "state", None)) or "Unknown"
+            for item, _kind in work_items
+        )
+        record["work_item_count"] = len(work_items)
+        record["work_item_states"] = dict(
+            sorted(state_counts.items(), key=lambda pair: (_top_state_sort_key(pair[0]), pair[0]))
+        )
+
+        selected = self._top_select_work_items(
+            work_items,
+            record.get("selected_work_item_id"),
+        )
+        record["work_items"] = [
+            self._top_work_item_record(item, item_kind, reason)
+            for item, item_kind, reason in selected
+        ]
+        record["work_item_details_omitted"] = max(0, len(work_items) - len(selected))
+        record["node_event_handlers"] = self._top_event_handler_records(pdg_node)
+        context = self._try_attr(pdg_node, "context", None)
+        context_handlers = self._try_attr(context, "eventHandlers", ()) or ()
+        record["graph_context_event_handler_count"] = len(context_handlers)
+
+        state_lower = str(cook_state or "").lower()
+        pdg_has_errors = bool((record.get("pdg_node") or {}).get("has_errors"))
+        if "fail" in state_lower or "error" in state_lower or pdg_has_errors:
+            record["houdini_messages"] = {
+                "errors": _as_plain(self._try_method(node, "errors", ()), self.max_text_chars),
+                "warnings": _as_plain(self._try_method(node, "warnings", ()), self.max_text_chars),
+                "messages": _as_plain(self._try_method(node, "messages", ()), self.max_text_chars),
+            }
+        return record
+
+    def _top_pdg_node_record(self, pdg_node: Any) -> Dict[str, Any]:
+        scheduler = self._try_attr(pdg_node, "scheduler", None)
+        return {
+            "name": self._try_attr(pdg_node, "name", None),
+            "node_type": _enum_short_token(self._try_attr(pdg_node, "nodeType", None)),
+            "is_cooked": self._try_attr(pdg_node, "isCooked", None),
+            "is_dynamic": self._try_attr(pdg_node, "isDynamic", None),
+            "is_dynamic_generator": self._try_attr(pdg_node, "isDynamicGenerator", None),
+            "has_errors": self._try_attr(pdg_node, "hasErrors", None),
+            "loop_depth": self._try_attr(pdg_node, "loopDepth", None),
+            "service_name": self._try_attr(pdg_node, "serviceName", None),
+            "scheduler": {
+                "name": self._try_attr(scheduler, "name", None),
+                "type": self._try_attr(scheduler, "typeName", None),
+            }
+            if scheduler is not None
+            else None,
+            "callback_type": self._top_callback_type_record(self._try_attr(pdg_node, "type", None)),
+        }
+
+    def _top_callback_type_record(self, callback_type: Any) -> Optional[Dict[str, Any]]:
+        if callback_type is None:
+            return None
+        record: Dict[str, Any] = {
+            "name": self._try_attr(callback_type, "typeName", None),
+            "label": self._try_attr(callback_type, "typeLabel", None),
+            "language": _enum_short_token(self._try_attr(callback_type, "language", None)),
+            "is_static_generator": self._try_attr(callback_type, "isStaticGenerator", None),
+        }
+        type_object = self._try_attr(callback_type, "typeObject", None)
+        if type_object is not None:
+            record["python_class"] = "%s.%s" % (
+                getattr(type_object, "__module__", "?"),
+                getattr(type_object, "__qualname__", getattr(type_object, "__name__", "?")),
+            )
+            record["implemented_callbacks"] = sorted(
+                name
+                for name, value in getattr(type_object, "__dict__", {}).items()
+                if name.startswith("on") and callable(value)
+            )
+            if self.include_scene_paths:
+                try:
+                    record["source_file"] = inspect.getsourcefile(type_object)
+                except Exception:
+                    pass
+        return {key: value for key, value in record.items() if value not in (None, [], {})}
+
+    def _top_all_work_items(self, pdg_node: Any) -> List[Tuple[Any, str]]:
+        records: List[Tuple[Any, str]] = []
+        seen: set = set()
+        for item_kind, property_name in (("work_item", "workItems"), ("partition", "partitions")):
+            for item in self._try_attr(pdg_node, property_name, ()) or ():
+                item_id = self._try_attr(item, "id", None)
+                key = item_id if item_id is not None else id(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append((item, item_kind))
+        records.sort(
+            key=lambda pair: (
+                self._try_attr(pair[0], "index", 0) or 0,
+                self._try_attr(pair[0], "id", 0) or 0,
+            )
+        )
+        return records
+
+    def _top_select_work_items(
+        self,
+        work_items: Sequence[Tuple[Any, str]],
+        selected_id: Any,
+    ) -> List[Tuple[Any, str, str]]:
+        if self.top_work_item_limit <= 0 or not work_items:
+            return []
+        selected: List[Tuple[Any, str, str]] = []
+        seen: set = set()
+
+        def add(item: Any, item_kind: str, reason: str) -> None:
+            if len(selected) >= self.top_work_item_limit:
+                return
+            item_id = self._try_attr(item, "id", None)
+            key = item_id if item_id is not None else id(item)
+            if key in seen:
+                return
+            seen.add(key)
+            selected.append((item, item_kind, reason))
+
+        # Errors and warnings are the primary purpose of the snapshot and are
+        # never displaced by ordinary successful samples.
+        for item, item_kind in work_items:
+            state = (_enum_short_token(self._try_attr(item, "state", None)) or "").lower()
+            if "fail" in state or "cancel" in state or bool(self._try_attr(item, "hasWarnings", False)):
+                add(item, item_kind, "error_or_warning")
+        for item, item_kind in work_items:
+            if self._try_attr(item, "id", None) == selected_id:
+                add(item, item_kind, "selected_in_ui")
+        for item, item_kind in work_items:
+            state = (_enum_short_token(self._try_attr(item, "state", None)) or "").lower()
+            if state in ("cooking", "scheduled", "waiting", "dirty"):
+                add(item, item_kind, "active_or_pending")
+
+        represented_states = {
+            _enum_short_token(self._try_attr(item, "state", None)) or "Unknown"
+            for item, _kind, _reason in selected
+        }
+        for item, item_kind in work_items:
+            state = _enum_short_token(self._try_attr(item, "state", None)) or "Unknown"
+            if state not in represented_states:
+                add(item, item_kind, "state_example")
+                represented_states.add(state)
+
+        # A few normal examples make attributes and generated commands visible
+        # even when every item is successful.
+        for item, item_kind in work_items:
+            if len(selected) >= min(self.top_work_item_limit, 8):
+                break
+            add(item, item_kind, "representative")
+        return selected
+
+    def _top_work_item_record(self, item: Any, item_kind: str, reason: str) -> Dict[str, Any]:
+        state = _enum_short_token(self._try_attr(item, "state", None))
+        record: Dict[str, Any] = {
+            "detail_reason": reason,
+            "kind": item_kind,
+            "id": self._try_attr(item, "id", None),
+            "index": self._try_attr(item, "index", None),
+            "name": self._try_attr(item, "name", None),
+            "label": self._try_attr(item, "label", None),
+            "state": state,
+            "cook_type": _enum_short_token(self._try_attr(item, "cookType", None)),
+            "execution_type": _enum_short_token(self._try_attr(item, "executionType", None)),
+            "frame": self._try_attr(item, "frame", None) if self._try_attr(item, "hasFrame", False) else None,
+            "priority": self._try_attr(item, "priority", None),
+            "cook_duration_seconds": self._try_attr(item, "cookDuration", None),
+            "cook_percent": self._try_attr(item, "cookPercent", None) if self._try_attr(item, "hasCookPercent", False) else None,
+            "custom_state": self._try_attr(item, "customState", None) if self._try_attr(item, "hasCustomState", False) else None,
+            "in_process": self._try_attr(item, "isInProcess", None),
+            "out_of_process": self._try_attr(item, "isOutOfProcess", None),
+            "command": _truncate_text(str(self._try_attr(item, "command", "") or ""), self.max_text_chars) or None,
+            "log_uri": self._try_attr(item, "logURI", None),
+            "attributes": self._top_work_item_attributes(item),
+            "input_files": self._top_file_records(self._try_attr(item, "inputFiles", ()) or ()),
+            "output_files": self._top_file_records(self._try_attr(item, "outputFiles", ()) or ()),
+            "expected_output_files": self._top_file_records(self._try_attr(item, "expectedOutputFiles", ()) or ()),
+            "dependencies": self._top_work_item_refs(self._try_attr(item, "dependencies", ()) or ()),
+            "failed_dependencies": self._top_work_item_refs(self._try_attr(item, "failedDependencies", ()) or ()),
+        }
+        log_messages = str(self._try_attr(item, "logMessages", "") or "")
+        if log_messages:
+            record["log"] = _maybe_long_text_record(log_messages, min(self.max_text_chars, DEFAULT_TOP_LOG_CHARS))
+            record["log_source"] = "pdg.WorkItem.logMessages"
+        elif _top_state_is_problem(state) or bool(self._try_attr(item, "hasWarnings", False)):
+            log_tail = self._top_local_log_tail(record.get("log_uri"))
+            if log_tail:
+                record["log"] = _maybe_long_text_record(log_tail, min(self.max_text_chars, DEFAULT_TOP_LOG_CHARS))
+                record["log_source"] = "local logURI tail"
+        return {key: value for key, value in record.items() if value not in (None, [], {}, "")}
+
+    def _top_work_item_attributes(self, item: Any) -> Dict[str, Any]:
+        names = sorted(str(name) for name in (self._try_method(item, "attribNames", ()) or ()))
+        values = self._try_method(item, "attribValues", {}) or {}
+        shown_names = names[:DEFAULT_TOP_ATTRIBUTE_LIMIT]
+        return {
+            "count": len(names),
+            "values": {
+                name: self._top_plain_value(values.get(name))
+                for name in shown_names
+                if isinstance(values, dict) and name in values
+            },
+            "names_without_value": [
+                name for name in shown_names if not isinstance(values, dict) or name not in values
+            ],
+            "omitted": max(0, len(names) - len(shown_names)),
+        }
+
+    def _top_plain_value(self, value: Any, depth: int = 0) -> Any:
+        if depth >= 3:
+            return "<nested value omitted>"
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return _truncate_text(value, min(self.max_text_chars, 1000))
+        if isinstance(value, dict):
+            items = list(value.items())
+            return {
+                "values": {
+                    str(key): self._top_plain_value(item_value, depth + 1)
+                    for key, item_value in items[:16]
+                },
+                "omitted": max(0, len(items) - 16),
+            }
+        if isinstance(value, (list, tuple, set)):
+            items = list(value)
+            return {
+                "count": len(items),
+                "sample": [self._top_plain_value(item_value, depth + 1) for item_value in items[:8]],
+                "omitted": max(0, len(items) - 8),
+            }
+        path = self._try_attr(value, "path", None)
+        if path is not None:
+            return self._top_file_record(value)
+        return _truncate_text(str(value), min(self.max_text_chars, 1000))
+
+    def _top_file_records(self, files: Sequence[Any]) -> Dict[str, Any]:
+        values = list(files or ())
+        return {
+            "count": len(values),
+            "files": [self._top_file_record(value) for value in values[:DEFAULT_TOP_FILE_LIMIT]],
+            "omitted": max(0, len(values) - DEFAULT_TOP_FILE_LIMIT),
+        }
+
+    def _top_file_record(self, file_object: Any) -> Dict[str, Any]:
+        return {
+            "path": self._try_attr(file_object, "path", None),
+            "local_path": self._try_attr(file_object, "local_path", None),
+            "tag": self._try_attr(file_object, "tag", None),
+            "type": _enum_short_token(self._try_attr(file_object, "type", None)),
+            "owned": self._try_attr(file_object, "owned", None),
+            "size": self._try_attr(file_object, "size", None),
+        }
+
+    def _top_work_item_refs(self, items: Sequence[Any]) -> Dict[str, Any]:
+        values = list(items or ())
+        return {
+            "count": len(values),
+            "items": [
+                {
+                    "id": self._try_attr(item, "id", None),
+                    "name": self._try_attr(item, "name", None),
+                    "state": _enum_short_token(self._try_attr(item, "state", None)),
+                }
+                for item in values[:8]
+            ],
+            "omitted": max(0, len(values) - 8),
+        }
+
+    def _top_local_log_tail(self, log_uri: Any) -> Optional[str]:
+        uri = str(log_uri or "").strip()
+        if not uri:
+            return None
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme not in ("", "file"):
+            return None
+        path = urllib.parse.unquote(parsed.path if parsed.scheme == "file" else uri)
+        if re.match(r"^/[A-Za-z]:/", path):
+            path = path[1:]
+        try:
+            path = hou.expandString(path) if hou is not None else os.path.expandvars(path)
+        except Exception:
+            path = os.path.expandvars(path)
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - DEFAULT_TOP_LOG_CHARS * 2), os.SEEK_SET)
+                data = handle.read()
+            text = data.decode("utf-8", errors="replace")
+            return text[-DEFAULT_TOP_LOG_CHARS:]
+        except Exception:
+            return None
+
+    def _top_event_handler_records(self, emitter: Any) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        for handler in self._try_attr(emitter, "eventHandlers", ()) or ():
+            callback = self._try_attr(handler, "callback", None)
+            if callback is None:
+                continue
+            record: Dict[str, Any] = {
+                "language": _enum_short_token(self._try_attr(handler, "language", None)),
+                "callback": "%s.%s" % (
+                    getattr(callback, "__module__", "?"),
+                    getattr(callback, "__qualname__", getattr(callback, "__name__", repr(callback))),
+                ),
+            }
+            try:
+                source = inspect.getsource(callback)
+            except Exception:
+                source = None
+            if source:
+                record["source"] = _maybe_long_text_record(
+                    source,
+                    min(self.max_text_chars, DEFAULT_TOP_LOG_CHARS),
+                )
+            records.append(record)
+        return records
 
     def _node_geometry(self, node: Any) -> Any:
         path = _path_of(node) or "<node:%s>" % id(node)
@@ -1648,6 +2064,11 @@ class HoudiniSceneExporter:
 
     def _detect_code_blocks(self, node: Any, tuple_record: Dict[str, Any]) -> List[Dict[str, Any]]:
         blocks = []
+        if self._node_is_top_node(node) and tuple_record.get("is_at_default") is True:
+            # Python Processor and Python Script TOPs ship with large callback
+            # templates. They document the node API but are not user-authored
+            # scene behavior and otherwise overwhelm the useful cook code.
+            return blocks
         tuple_name = str(tuple_record.get("name") or "").lower()
         label = str(tuple_record.get("label") or "").lower()
         template = tuple_record.get("template", {})
@@ -1818,6 +2239,15 @@ class HoudiniSceneExporter:
         geometry = self._node_geometry(node)
         if geometry is None:
             return None
+        summary = self._geometry_summary_record(geometry)
+        unpacked_geometry, packed_inspection = self._temporary_unpacked_folder_geometry(geometry)
+        if packed_inspection is not None:
+            summary["packed_inspection"] = packed_inspection
+        if unpacked_geometry is not None:
+            summary["unpacked_geometry"] = self._geometry_summary_record(unpacked_geometry)
+        return summary
+
+    def _geometry_summary_record(self, geometry: Any) -> Dict[str, Any]:
         primitive_samples = self._sample_geometry_elements(geometry, "iterPrims", "prims")
         vertices = self._sample_vertices_from_prims(primitive_samples, self.geometry_sample_count)
         attributes: Dict[str, List[Dict[str, Any]]] = {}
@@ -1851,6 +2281,204 @@ class HoudiniSceneExporter:
                 "edge": self._group_records(geometry, "edgeGroups"),
             },
         }
+
+    def _temporary_unpacked_folder_geometry(
+        self,
+        geometry: Any,
+    ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+        """Inspect packed contents on temporary geometry, never changing the HIP."""
+        packed_state = self._geometry_contains_packed_primitives(geometry)
+        if packed_state is False:
+            # extractPackedPaths() can also derive paths from an ordinary
+            # string name attribute. Those paths are not packed contents.
+            return None, None
+        extract_paths = _method(geometry, "extractPackedPaths")
+        unpack_from_folder = _method(geometry, "unpackFromFolder")
+        geometry_class = getattr(hou, "Geometry", None) if hou is not None else None
+        if geometry_class is None:
+            return None, None
+        raw_paths = ()
+        if extract_paths is not None and unpack_from_folder is not None:
+            try:
+                raw_paths = extract_paths("*") or ()
+            except Exception:
+                raw_paths = ()
+        paths = sorted(
+            {
+                self._normalize_packed_path(path)
+                for path in raw_paths
+                if str(path or "").strip()
+            }
+            - {"/"}
+        )
+        if not paths:
+            return self._temporary_unpacked_embedded_geometry(geometry, geometry_class)
+
+        # Folder listings may contain parents and children. Unpacking only the
+        # leaves avoids merging the same contents more than once.
+        leaf_paths = [
+            path
+            for path in paths
+            if not any(other.startswith(path.rstrip("/") + "/") for other in paths if other != path)
+        ]
+        try:
+            merged = geometry_class()
+        except Exception as exc:
+            return None, {
+                "detected": True,
+                "kind": "packed_folder",
+                "method": "hou.Geometry.unpackFromFolder(path) on a temporary geometry copy",
+                "source_geometry_unchanged": True,
+                "packed_path_count": len(paths),
+                "leaf_path_count": len(leaf_paths),
+                "unpacked_path_count": 0,
+                "failed_path_count": len(leaf_paths),
+                "errors": ["%s: %s" % (exc.__class__.__name__, exc)],
+            }
+
+        unpacked_count = 0
+        empty_count = 0
+        failed: List[str] = []
+        for path in leaf_paths:
+            try:
+                unpacked = unpack_from_folder(path)
+                if unpacked is None:
+                    failed.append("%s: no geometry returned" % path)
+                    continue
+                if not self._temporary_geometry_has_contents(unpacked):
+                    empty_count += 1
+                    continue
+                merged.merge(unpacked)
+                unpacked_count += 1
+            except Exception as exc:
+                if len(failed) < 20:
+                    failed.append("%s: %s: %s" % (path, exc.__class__.__name__, exc))
+
+        inspection = {
+            "detected": True,
+            "kind": "packed_folder",
+            "method": "hou.Geometry.unpackFromFolder(path) on a temporary geometry copy",
+            "source_geometry_unchanged": True,
+            "packed_path_count": len(paths),
+            "leaf_path_count": len(leaf_paths),
+            "unpacked_path_count": unpacked_count,
+            "failed_path_count": max(0, len(leaf_paths) - unpacked_count),
+            "empty_path_count": empty_count,
+            "errors": failed,
+        }
+        if unpacked_count == 0:
+            # A real packed primitive can occasionally expose folder names
+            # whose leaves do not directly return geometry. Try ordinary
+            # embedded packed geometry before giving up.
+            fallback_geometry, fallback_inspection = self._temporary_unpacked_embedded_geometry(
+                geometry,
+                geometry_class,
+            )
+            if fallback_geometry is not None:
+                return fallback_geometry, fallback_inspection
+            # All-empty paths are usually ordinary name-attribute values, not
+            # packed folders. Suppress the misleading packed section entirely.
+            if empty_count == len(leaf_paths) and not failed:
+                return None, None
+            return None, inspection
+        return merged, inspection
+
+    def _geometry_contains_packed_primitives(self, geometry: Any) -> Optional[bool]:
+        prim_type = getattr(hou, "primType", None) if hou is not None else None
+        packed_prim_type = getattr(prim_type, "PackedPrim", None) if prim_type is not None else None
+        contains_prim_type = _method(geometry, "containsPrimType")
+        if contains_prim_type is None or packed_prim_type is None:
+            return None
+        try:
+            return bool(contains_prim_type(packed_prim_type))
+        except Exception:
+            return None
+
+    def _temporary_geometry_has_contents(self, geometry: Any) -> bool:
+        """Treat a known-empty geometry as no unpack result; keep detail-only data."""
+        counts = [
+            self._geometry_intrinsic(geometry, "pointcount"),
+            self._geometry_intrinsic(geometry, "vertexcount"),
+            self._geometry_intrinsic(geometry, "primitivecount"),
+        ]
+        known_counts = [count for count in counts if count is not None]
+        try:
+            if any(int(count) > 0 for count in known_counts):
+                return True
+        except Exception:
+            return True
+        if not known_counts:
+            # Preserve compatibility with geometry-like HOM wrappers whose
+            # count intrinsics are unavailable.
+            return True
+        try:
+            detail_attributes = self._try_method(geometry, "globalAttribs", ()) or ()
+            return bool(detail_attributes)
+        except Exception:
+            return False
+
+    def _temporary_unpacked_embedded_geometry(
+        self,
+        geometry: Any,
+        geometry_class: Any,
+    ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+        """Fallback for ordinary packed primitives that have no folder leaves."""
+        if self._geometry_contains_packed_primitives(geometry) is False:
+            return None, None
+        iter_prims = _method(geometry, "iterPrims") or _method(geometry, "prims")
+        if iter_prims is None:
+            return None, None
+        try:
+            primitives = iter_prims()
+            merged = geometry_class()
+        except Exception:
+            return None, None
+
+        packed_count = 0
+        unpacked_count = 0
+        empty_count = 0
+        failed: List[str] = []
+        for index, primitive in enumerate(primitives or ()):
+            embedded_geometry = _method(primitive, "getEmbeddedGeometry")
+            if embedded_geometry is None:
+                continue
+            packed_count += 1
+            try:
+                unpacked = embedded_geometry()
+                if unpacked is None:
+                    if len(failed) < 20:
+                        failed.append("primitive %s: no embedded geometry returned" % index)
+                    continue
+                if not self._temporary_geometry_has_contents(unpacked):
+                    empty_count += 1
+                    continue
+                merged.merge(unpacked)
+                unpacked_count += 1
+            except Exception as exc:
+                if len(failed) < 20:
+                    failed.append("primitive %s: %s: %s" % (index, exc.__class__.__name__, exc))
+        if packed_count == 0:
+            return None, None
+
+        inspection = {
+            "detected": True,
+            "kind": "packed_primitives",
+            "method": "hou.PackedGeometry.getEmbeddedGeometry() merged into temporary geometry",
+            "source_geometry_unchanged": True,
+            "packed_path_count": 0,
+            # Retained as the common rendered item count for compatibility.
+            "leaf_path_count": packed_count,
+            "packed_primitive_count": packed_count,
+            "unpacked_path_count": unpacked_count,
+            "failed_path_count": max(0, packed_count - unpacked_count),
+            "empty_path_count": empty_count,
+            "errors": failed,
+        }
+        if unpacked_count == 0:
+            if empty_count == packed_count and not failed:
+                return None, None
+            return None, inspection
+        return merged, inspection
 
     def _attribute_scopes(self) -> List[Tuple[str, Any]]:
         scopes: List[Tuple[str, Any]] = []
@@ -1947,12 +2575,69 @@ class HoudiniSceneExporter:
             "string_table": self._attribute_table_record(attrib, "strings", string_count),
             "dict_table": self._attribute_table_record(attrib, "dicts", dict_count),
         }
+        value_counts = self._attribute_value_counts(geometry, attrib, owner)
+        if value_counts is not None:
+            record["value_counts"] = value_counts
         index_pair_tables = self._try_method(attrib, "indexPairPropertyTables", ())
         if index_pair_tables:
             record["index_pair_property_tables"] = _as_plain(index_pair_tables, self.max_text_chars)
         if samples:
             record["sample_values"] = samples
         return {key: value for key, value in record.items() if value is not None}
+
+    def _attribute_value_counts(
+        self,
+        geometry: Any,
+        attrib: Any,
+        owner: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Summarize categorical attributes without dumping one value per element."""
+        if owner not in ("point", "vertex", "primitive"):
+            return None
+        if self._try_method(attrib, "isArrayType", False):
+            return None
+        try:
+            if int(self._try_method(attrib, "size", 1) or 1) != 1:
+                return None
+        except Exception:
+            return None
+        data_type = str(_enum_to_string(self._try_method(attrib, "dataType", None)) or "").lower()
+        owner_prefix = {"point": "point", "vertex": "vertex", "primitive": "prim"}[owner]
+        if "string" in data_type:
+            method_name = owner_prefix + "StringAttribValues"
+        elif "int" in data_type:
+            method_name = owner_prefix + "IntAttribValues"
+        else:
+            return None
+        name = self._try_method(attrib, "name", None)
+        if not name:
+            return None
+        values = self._try_method(geometry, method_name, None, name)
+        if values is None:
+            return None
+        try:
+            counter = collections.Counter(values)
+        except Exception:
+            return None
+        if not counter:
+            return None
+
+        # Integer IDs are often unique and add no insight as a value list.
+        # Preserve their cardinality but list items only when reasonably small.
+        ordered = sorted(counter.items(), key=lambda item: (-item[1], str(item[0])))
+        unique_count = len(ordered)
+        items = []
+        if "string" in data_type or unique_count <= ATTRIBUTE_CATEGORY_VALUE_LIMIT:
+            items = [
+                {"value": _as_plain(value, self.max_text_chars), "count": count}
+                for value, count in ordered[:ATTRIBUTE_CATEGORY_VALUE_LIMIT]
+            ]
+        return {
+            "total_count": sum(counter.values()),
+            "unique_count": unique_count,
+            "items": items,
+            "items_truncated": unique_count > len(items),
+        }
 
     def _attribute_table_record(self, attrib: Any, method_name: str, count: int) -> Dict[str, Any]:
         sample: List[Any] = []
@@ -1966,8 +2651,6 @@ class HoudiniSceneExporter:
         }
 
     def _attribute_sample_values(self, geometry: Any, attrib: Any, owner: str, elements: Sequence[Any]) -> List[Dict[str, Any]]:
-        if self.geometry_sample_count == 0:
-            return []
         if owner == "global":
             value = self._try_method(geometry, "attribValue", None, attrib)
             if value is None:
@@ -1978,6 +2661,8 @@ class HoudiniSceneExporter:
                     if value is None:
                         value = self._try_method(geometry, "dictValue", None, name)
             return [{"value": _as_plain(value, self.max_text_chars)}]
+        if self.geometry_sample_count == 0:
+            return []
         if owner == "vertex":
             return self._vertex_attribute_sample_values(attrib, elements)
         samples = []
@@ -2119,10 +2804,18 @@ def _houdini_version_suffix(data: Dict[str, Any]) -> str:
 def _llm_footer_lines(data: Dict[str, Any]) -> List[str]:
     version = (data.get("scene", {}) or {}).get("houdini_version")
     label = "Houdini %s" % version if version else "Houdini"
-    if (data.get("options", {}) or {}).get("markdown_mode") in ("smart", "rbd_smart"):
+    markdown_mode = (data.get("options", {}) or {}).get("markdown_mode")
+    if markdown_mode in ("attributes", "ultra"):
+        omission_rule = (
+            "これはアトリビュート専用ダンプです。記載のない公開アトリビュートは存在しないものとして扱ってください。"
+            "private アトリビュートは明示設定時だけ対象です。"
+            "ノードのパラメータ値はこのダンプから推測しないでください。"
+        )
+    elif markdown_mode in ("smart", "rbd_smart"):
         omission_rule = (
             "Smart セクションで記載のない現在有効な UI 設定は Houdini のデフォルト値です。"
             "非表示の内部パラメータは意図的に対象外であり、その値を推測しないでください。"
+            "TOP / PDG は書き出し時点ですでに生成済みの状態だけを読み取っており、このダンプ作成のためのcookは実行していません。"
         )
     else:
         omission_rule = "それ以外の記載のないパラメータは Houdini のデフォルト値とみなしてください。"
@@ -2774,6 +3467,212 @@ def _smart_parameter_lines(
     return lines, selected_names
 
 
+_TOP_CODE_PHASES = {
+    "generate": "work-item generation (`onGenerate`)",
+    "regeneratestatic": "work-item regeneration (`onRegenerate`)",
+    "addinternaldependencies": "dependency creation after generation (`onAddInternalDependencies`)",
+    "cooktask": "in-process work-item cook (`onCookTask`)",
+    "prescript": "batch setup before work-item processing",
+    "expectedscript": "expected-output declaration during work-item setup",
+    "pdg_command": "scheduled work-item command",
+}
+
+
+def _top_execution_phase(node: Dict[str, Any], block: Dict[str, Any]) -> str:
+    parm_name = str(block.get("tuple_name") or block.get("parm_name") or "").lower()
+    if parm_name == "script":
+        cook_type = _compact_parameter_by_name(node.get("parameters", []) or [], "pdg_cooktype")
+        value = _compact_parameter_scalar(cook_type)
+        label = _compact_menu_value_label(cook_type, value) or str(value or "")
+        label_lower = label.lower()
+        if "generate" in label_lower or str(value) == "0":
+            return "work-item generation (no cook-time script)"
+        if "in-process" in label_lower or str(value) == "1":
+            return "each work-item cook inside Houdini (in-process)"
+        if "out-of-process" in label_lower or str(value) == "2":
+            return "each work-item cook in a child Python process"
+        if "service" in label_lower or str(value) == "3":
+            return "each work-item cook in a PDG service"
+        return "Python Script TOP execution (%s)" % (label or "timing unknown")
+    return _TOP_CODE_PHASES.get(parm_name, "TOP callback / execution script")
+
+
+def _top_execution_code_lines(
+    node: Dict[str, Any],
+    code_blocks: Sequence[Dict[str, Any]],
+) -> Tuple[List[str], set]:
+    if not code_blocks:
+        return [], set()
+    lines = ["", "#### TOP execution code", ""]
+    rendered_keys = set()
+    for block in code_blocks:
+        text_record = block.get("text", {})
+        text = text_record.get("text", "") if isinstance(text_record, dict) else ""
+        if not str(text or "").strip():
+            continue
+        parm_name = block.get("tuple_name") or block.get("parm_name") or "?"
+        lines.append("- `%s`: %s" % (parm_name, _top_execution_phase(node, block)))
+        lines.append("")
+        lines.append("```%s" % (block.get("language_guess") or "text"))
+        lines.append(str(text).rstrip())
+        lines.append("```")
+        lines.append("")
+        rendered_keys.add(_compact_code_key(block))
+    if not rendered_keys:
+        return [], set()
+    return lines, rendered_keys
+
+
+def _top_summary_lines(summary: Any) -> List[str]:
+    if not isinstance(summary, dict):
+        return []
+    lines = ["", "#### TOP / PDG snapshot", ""]
+    cook_state = summary.get("cook_state") or "Unknown"
+    lines.append(
+        "- Current cook state: `%s`. This is a read-only snapshot; the exporter did not generate, cook, dirty, or cancel work items."
+        % cook_state
+    )
+    if str(cook_state).lower() in ("cooking", "scheduled", "waiting"):
+        lines.append("- The TOP cook is active, so states, logs, and output files are a momentary snapshot and may change after this export.")
+    classification = summary.get("classification", {}) or {}
+    roles = [
+        role.title()
+        for role in ("processor", "partitioner", "mapper", "scheduler")
+        if classification.get(role) is True
+    ]
+    if roles:
+        lines.append("- TOP role: `%s`" % ", ".join(roles))
+    if not summary.get("pdg_node_available"):
+        lines.append("- PDG data: not generated in this Houdini session, so no work items or runtime errors are available.")
+        return lines
+
+    pdg_node = summary.get("pdg_node", {}) or {}
+    node_bits = []
+    if pdg_node.get("name"):
+        node_bits.append("node=`%s`" % pdg_node.get("name"))
+    if pdg_node.get("is_dynamic") is not None:
+        node_bits.append("generation=%s" % ("dynamic" if pdg_node.get("is_dynamic") else "static"))
+    if pdg_node.get("service_name"):
+        node_bits.append("service=`%s`" % pdg_node.get("service_name"))
+    scheduler = pdg_node.get("scheduler", {}) or {}
+    scheduler_name = scheduler.get("name") or scheduler.get("type")
+    if scheduler_name:
+        node_bits.append("scheduler=`%s`" % scheduler_name)
+    if node_bits:
+        lines.append("- PDG node: " + "; ".join(node_bits))
+    callback_type = pdg_node.get("callback_type", {}) or {}
+    callback_names = callback_type.get("implemented_callbacks") or []
+    if callback_names:
+        lines.append(
+            "- PDG implementation: `%s` (%s); callbacks: %s"
+            % (
+                callback_type.get("label") or callback_type.get("name") or "?",
+                callback_type.get("language") or "unknown language",
+                ", ".join("`%s`" % name for name in callback_names),
+            )
+        )
+
+    state_counts = summary.get("work_item_states", {}) or {}
+    state_text = ", ".join("%s=%s" % (state, count) for state, count in state_counts.items())
+    lines.append("- Work items: %s%s" % (summary.get("work_item_count", 0), ("; " + state_text) if state_text else ""))
+    handler_count = len(summary.get("node_event_handlers", []) or [])
+    context_handler_count = summary.get("graph_context_event_handler_count", 0) or 0
+    if handler_count or context_handler_count:
+        lines.append(
+            "- Registered event handlers currently present: node Python=%s, graph context total=%s (event filters are not exposed by HOM)."
+            % (handler_count, context_handler_count)
+        )
+        for handler in summary.get("node_event_handlers", []) or []:
+            lines.append("  - Node handler: `%s` (%s)" % (handler.get("callback"), handler.get("language") or "unknown"))
+
+    houdini_messages = summary.get("houdini_messages", {}) or {}
+    seen_houdini_messages: set = set()
+    for kind in ("errors", "warnings", "messages"):
+        values = houdini_messages.get(kind) or []
+        for value in values:
+            # Houdini can expose the same TOP diagnostic through errors(),
+            # warnings(), and messages().  Print it once, under the most
+            # severe collection in which it appeared.
+            message_key = str(value)
+            if message_key in seen_houdini_messages:
+                continue
+            seen_houdini_messages.add(message_key)
+            lines.append("- TOP %s: %s" % (kind[:-1].title(), _inline_text(str(value), 500)))
+
+    items = summary.get("work_items", []) or []
+    if items:
+        lines.extend(["", "##### Work-item details", ""])
+    for item in items:
+        identity = item.get("name") or "work item"
+        id_bits = []
+        if item.get("id") is not None:
+            id_bits.append("id=%s" % item.get("id"))
+        if item.get("index") is not None:
+            id_bits.append("index=%s" % item.get("index"))
+        state = item.get("state") or "Unknown"
+        line = "- `%s`%s — `%s`" % (
+            identity,
+            " (" + ", ".join(id_bits) + ")" if id_bits else "",
+            state,
+        )
+        if item.get("detail_reason") == "error_or_warning":
+            line += " **[error/warning]**"
+        lines.append(line)
+        facts = []
+        if item.get("label") and item.get("label") != identity:
+            facts.append("label=%s" % _markdown_inline_code(item.get("label"), 120))
+        if item.get("cook_type"):
+            facts.append("cook=%s" % item.get("cook_type"))
+        if item.get("frame") is not None:
+            facts.append("frame=%s" % item.get("frame"))
+        if item.get("cook_duration_seconds") is not None:
+            facts.append("duration=%gs" % float(item.get("cook_duration_seconds")))
+        if item.get("custom_state"):
+            facts.append("custom state=%s" % _markdown_inline_code(item.get("custom_state"), 120))
+        if facts:
+            lines.append("  - " + "; ".join(facts))
+        if item.get("command"):
+            lines.append("  - Command: %s" % _markdown_inline_code(item.get("command"), 500))
+        attributes = item.get("attributes", {}) or {}
+        attribute_values = attributes.get("values", {}) or {}
+        if attribute_values:
+            value_text = json.dumps(attribute_values, ensure_ascii=False, separators=(",", ":"))
+            lines.append("  - Attributes: %s" % _markdown_inline_code(value_text, 700))
+        if attributes.get("omitted"):
+            lines.append("  - Attributes omitted: %s" % attributes.get("omitted"))
+        failed_dependencies = item.get("failed_dependencies", {}) or {}
+        if failed_dependencies.get("count"):
+            refs = ", ".join(
+                "%s (%s)" % (ref.get("name") or ref.get("id"), ref.get("state") or "?")
+                for ref in failed_dependencies.get("items", []) or []
+            )
+            lines.append("  - Failed dependencies: %s" % refs)
+        for label, key in (("Outputs", "output_files"), ("Expected outputs", "expected_output_files")):
+            file_record = item.get(key, {}) or {}
+            if not file_record.get("count"):
+                continue
+            paths = [file_info.get("path") or file_info.get("local_path") for file_info in file_record.get("files", []) or []]
+            paths = [path for path in paths if path]
+            suffix = "; +%s more" % file_record.get("omitted") if file_record.get("omitted") else ""
+            lines.append("  - %s: %s%s" % (label, ", ".join(_markdown_inline_code(path, 240) for path in paths), suffix))
+        log = item.get("log", {}) or {}
+        log_text = log.get("text") if isinstance(log, dict) else None
+        if log_text:
+            lines.append("  - Log (%s):" % (item.get("log_source") or "PDG"))
+            lines.append("")
+            lines.append("    ```text")
+            lines.extend("    " + line for line in str(log_text).rstrip().splitlines())
+            lines.append("    ```")
+            lines.append("")
+        elif _top_state_is_problem(state) and item.get("log_uri"):
+            lines.append("  - Log URI: %s" % _markdown_inline_code(item.get("log_uri"), 500))
+
+    omitted = summary.get("work_item_details_omitted", 0) or 0
+    if omitted:
+        lines.append("- Work-item details omitted: %s (state totals above are complete)" % omitted)
+    return lines
+
+
 def render_compact_markdown(data: Dict[str, Any], smart: bool = False) -> str:
     nodes = sorted(data.get("nodes", []), key=lambda row: str(row.get("path", "")))
     connections = data.get("connections", [])
@@ -2786,7 +3685,7 @@ def render_compact_markdown(data: Dict[str, Any], smart: bool = False) -> str:
     lines.append("- Exporter: `%s %s`" % (EXPORTER_NAME, SCHEMA_VERSION))
     lines.append("- Connection notation: `A -> B -> C` means each node's first output feeds the next node's first input; other ports are marked like `[output2]` / `[input3: Constraint Geometry]`.")
     if smart:
-        lines.append("- Mode: `Smart (experimental)`. Node settings use the current visible Houdini UI labels, folder labels, and menu choice labels; hidden internal parameters and numeric menu tokens are omitted. Code-focused nodes retain their compact code-oriented presentation.")
+        lines.append("- Mode: `Smart (experimental)`. Node settings use the current visible Houdini UI labels, folder labels, and menu choice labels; hidden internal parameters and numeric menu tokens are omitted. Code-focused nodes retain their compact code-oriented presentation. TOP nodes also include a read-only snapshot of already-generated PDG work items, failures, logs, commands, and cook-time scripts; exporting does not start a TOP cook.")
     lines.append("")
 
     lines.append("## Connections")
@@ -2813,6 +3712,7 @@ def render_compact_markdown(data: Dict[str, Any], smart: bool = False) -> str:
         if (
             _node_type_record_suppresses_parameters(node.get("type", {}))
             and not _parameters_have_channel_details(node_parameters)
+            and not (smart and node.get("top_summary"))
         ):
             continue
         code_refs = [block for block in node.get("code_blocks", []) if block.get("node_path") == node.get("path")]
@@ -2833,13 +3733,30 @@ def render_compact_markdown(data: Dict[str, Any], smart: bool = False) -> str:
         if comment:
             lines.append("- Comment: %s" % _inline_text(str(comment), 240))
         lines.extend(_render_packed_rig_tree(node.get("packed_rig_tree")))
+        if smart and node.get("top_summary"):
+            lines.extend(_top_summary_lines(node.get("top_summary")))
+        top_code_keys: set = set()
+        if smart and node.get("top_summary"):
+            top_code_lines, top_code_keys = _top_execution_code_lines(node, code_refs)
+            lines.extend(top_code_lines)
+            inline_code_keys.update(top_code_keys)
         if is_wrangle:
             wrangle_lines, wrangle_code_keys = _compact_wrangle_lines(node)
             lines.extend(wrangle_lines)
             inline_code_keys.update(wrangle_code_keys)
         smart_selected_names: set = set()
         if is_smart_node:
-            smart_lines, smart_selected_names = _smart_parameter_lines(node, node_parameters, inspector_path_base)
+            top_code_names = {
+                str(block.get("tuple_name") or block.get("parm_name") or "")
+                for block in code_refs
+                if _compact_code_key(block) in top_code_keys
+            }
+            smart_parameters = [
+                parm_tuple
+                for parm_tuple in node_parameters
+                if str(parm_tuple.get("name") or "") not in top_code_names
+            ]
+            smart_lines, smart_selected_names = _smart_parameter_lines(node, smart_parameters, inspector_path_base)
             lines.extend(smart_lines)
             for block in code_refs:
                 block_tuple_name = block.get("tuple_name") or block.get("parm_name")
@@ -3482,6 +4399,7 @@ def _compact_plain_text(value: Any, limit: int = 160) -> str:
 
 DEFAULT_ULTRA_MAX_RUNS = 2000
 DEFAULT_ULTRA_SAMPLE_COUNT = 5
+ATTRIBUTE_CATEGORY_VALUE_LIMIT = 64
 
 
 def _ultra_value_text(value: Any) -> str:
@@ -3812,24 +4730,185 @@ def _ultra_geometry_lines(summary: Dict[str, Any]) -> List[str]:
     return lines
 
 
+_ATTRIBUTE_OWNER_TITLES = {
+    "point": "Point attributes",
+    "vertex": "Vertex attributes",
+    "primitive": "Primitive attributes",
+    "global": "Detail attributes",
+}
+
+_ATTRIBUTE_OWNER_COUNT_KEYS = {
+    "point": "points",
+    "vertex": "vertices",
+    "primitive": "primitives",
+    "global": None,
+}
+
+_ATTRIBUTE_OWNER_UNITS = {
+    "point": ("point", "points"),
+    "vertex": ("vertex", "vertices"),
+    "primitive": ("primitive", "primitives"),
+    "global": ("detail value", "detail values"),
+}
+
+
+def _attribute_storage_type(attrib: Dict[str, Any]) -> str:
+    type_text = str(attrib.get("data_type") or attrib.get("type") or "?")
+    if "." in type_text:
+        type_text = type_text.rsplit(".", 1)[-1]
+    type_text = type_text.lower()
+    try:
+        size = int(attrib.get("size") or 1)
+    except Exception:
+        size = 1
+    if size > 1:
+        type_text += "[%d]" % size
+    if attrib.get("is_array"):
+        type_text += " array"
+    return type_text
+
+
+def _attribute_unit(owner: str, count: Any, packed_pieces: bool = False) -> str:
+    if packed_pieces and owner == "primitive":
+        singular, plural = "packed piece", "packed pieces"
+    else:
+        singular, plural = _ATTRIBUTE_OWNER_UNITS.get(owner, (owner, owner + "s"))
+    try:
+        return singular if int(count) == 1 else plural
+    except Exception:
+        return plural
+
+
+def _attribute_distribution_lines(
+    attrib: Dict[str, Any],
+    owner: str,
+    packed_pieces: bool,
+) -> List[str]:
+    distribution = attrib.get("value_counts")
+    if not isinstance(distribution, dict):
+        return []
+    total = distribution.get("total_count")
+    unique = distribution.get("unique_count")
+    items = distribution.get("items") or []
+    if not items:
+        if unique not in (None, 0):
+            return ["  - Values: %s unique values (individual values omitted)" % unique]
+        return []
+
+    total_unit = _attribute_unit(owner, total, packed_pieces)
+    try:
+        high_cardinality = int(unique or 0) > 20 and float(unique or 0) / max(1.0, float(total or 0)) > 0.5
+    except Exception:
+        high_cardinality = False
+    if high_cardinality:
+        shown = items[:8]
+        pieces = [
+            "%s (%s %s)"
+            % (
+                _markdown_inline_code(item.get("value"), 100),
+                item.get("count"),
+                _attribute_unit(owner, item.get("count"), packed_pieces),
+            )
+            for item in shown
+        ]
+        suffix = "; ..." if int(unique or 0) > len(shown) else ""
+        return [
+            "  - Values: %s unique across %s %s; examples: %s%s"
+            % (unique, total, total_unit, "; ".join(pieces), suffix)
+        ]
+
+    pieces = [
+        "%s (%s %s)"
+        % (
+            _markdown_inline_code(item.get("value"), 120),
+            item.get("count"),
+            _attribute_unit(owner, item.get("count"), packed_pieces),
+        )
+        for item in items[:16]
+    ]
+    suffix = "; ... +%d more values" % (int(unique) - len(pieces)) if int(unique or 0) > len(pieces) else ""
+    return ["  - Values: %s%s" % ("; ".join(pieces), suffix)]
+
+
+def _simple_attribute_scope_lines(
+    summary: Dict[str, Any],
+    owner: str,
+    packed_pieces: bool = False,
+) -> List[str]:
+    attributes = (summary.get("attributes", {}) or {}).get(owner, []) or []
+    title = _ATTRIBUTE_OWNER_TITLES.get(owner, owner.title() + " attributes")
+    lines = ["#### %s" % title, ""]
+    if not attributes:
+        lines.extend(["(none)", ""])
+        return lines
+    counts = summary.get("counts", {}) or {}
+    count_key = _ATTRIBUTE_OWNER_COUNT_KEYS.get(owner)
+    element_count = 1 if owner == "global" else counts.get(count_key)
+    for attrib in attributes:
+        name = attrib.get("name") or "?"
+        type_text = _attribute_storage_type(attrib)
+        if owner == "global":
+            samples = attrib.get("sample_values") or []
+            if samples:
+                value_text = _markdown_inline_code(_ultra_value_text(samples[0].get("value")), 240)
+                lines.append("- `%s` (%s): %s" % (name, type_text, value_text))
+            else:
+                lines.append("- `%s` (%s): detail value present" % (name, type_text))
+        else:
+            use_piece_unit = packed_pieces and owner == "primitive" and str(name).lower() == "name"
+            unit = _attribute_unit(owner, element_count, use_piece_unit)
+            lines.append("- `%s` (%s): %s %s" % (name, type_text, element_count, unit))
+            lines.extend(_attribute_distribution_lines(attrib, owner, use_piece_unit))
+    lines.append("")
+    return lines
+
+
+def _simple_geometry_attribute_lines(
+    summary: Dict[str, Any],
+    heading: str,
+    packed_pieces: bool = False,
+) -> List[str]:
+    counts = summary.get("counts", {}) or {}
+    attribute_counts = summary.get("attribute_counts", {}) or {}
+    lines = ["### %s" % heading, ""]
+    lines.append(
+        "- Geometry: %s points, %s vertices, %s primitives"
+        % (counts.get("points"), counts.get("vertices"), counts.get("primitives"))
+    )
+    lines.append(
+        "- Attribute owners: point=%s, vertex=%s, primitive=%s, detail=%s"
+        % (
+            attribute_counts.get("point", 0),
+            attribute_counts.get("vertex", 0),
+            attribute_counts.get("primitive", 0),
+            attribute_counts.get("global", 0),
+        )
+    )
+    lines.append("")
+    for owner in ("point", "vertex", "primitive", "global"):
+        lines.extend(_simple_attribute_scope_lines(summary, owner, packed_pieces))
+    return lines
+
+
 def render_ultra_markdown(data: Dict[str, Any]) -> str:
-    nodes = sorted(data.get("nodes", []), key=lambda row: str(row.get("path", "")))
-    node_info = _compact_node_info(nodes)
+    nodes = [
+        node
+        for node in sorted(data.get("nodes", []), key=lambda row: str(row.get("path", "")))
+        if node.get("geometry_summary")
+    ]
 
     lines: List[str] = []
-    lines.append("# Houdini Attribute Report%s" % _houdini_version_suffix(data))
+    lines.append("# Houdini Attribute Summary%s" % _houdini_version_suffix(data))
     lines.append("")
-    lines.append("- Attribute values are listed in element order; `value (xN)` means N consecutive elements share that value.")
+    lines.append("- Each attribute shows its storage type and how many elements carry it. Large per-element values such as `P` are counted, not dumped.")
+    lines.append("- Categorical attributes such as RBD `name` include value counts when useful.")
+    lines.append("- Packed contents are inspected only on temporary geometry using Houdini's Unpack / Unpack Folder equivalents; the source node and HIP are not modified.")
     lines.append("")
 
-    connection_lines = _compact_connection_lines(data.get("connections", []), node_info, nodes)
-    if connection_lines:
-        lines.append("## Connections")
+    if not nodes:
+        lines.append("(no SOP geometry was captured)")
         lines.append("")
-        lines.extend(connection_lines)
-        lines.append("")
-
-    for node in _attention_ordered_nodes(nodes):
+    for node in nodes:
         node_type_record = node.get("type", {}) or {}
         node_type = node_type_record.get("name_with_category") or node_type_record.get("name")
         type_description = node_type_record.get("description")
@@ -3838,23 +4917,53 @@ def render_ultra_markdown(data: Dict[str, Any]) -> str:
             heading += " (%s)" % type_description
         lines.append(heading)
         lines.append("")
-        flags = _compact_true_flags(node.get("flags", {}) or {})
-        if flags:
-            lines.append("- Flags: `%s`" % ",".join(flags))
-        comment = node.get("comment")
-        if comment:
-            lines.append("- Comment: %s" % _inline_text(str(comment), 240))
-        lines.extend(_render_packed_rig_tree(node.get("packed_rig_tree")))
-        lines.extend(_ultra_parameter_lines(node.get("parameters", [])))
-        lines.append("")
         geometry_summary = node.get("geometry_summary")
-        if geometry_summary:
-            lines.append("### Geometry of `%s`" % node.get("path"))
+        packed = geometry_summary.get("packed_inspection") if isinstance(geometry_summary, dict) else None
+        if isinstance(packed, dict):
+            packed_count = packed.get("leaf_path_count")
+            unpacked_count = packed.get("unpacked_path_count")
+            failed_count = packed.get("failed_path_count")
+            unpacked_summary = geometry_summary.get("unpacked_geometry")
+            if not isinstance(unpacked_summary, dict):
+                lines.append(
+                    "- Packed inspection warning: packed candidates were found, but no internal geometry could be read. No temporary-unpack section was produced; the source geometry and HIP were not changed."
+                )
+                lines.append("")
+                lines.extend(_simple_geometry_attribute_lines(geometry_summary, "Attributes"))
+                continue
+            if packed.get("kind") == "packed_primitives":
+                lines.append(
+                    "- Packed inspection: detected %s packed primitives; temporarily unpacked %s embedded geometries (standard Unpack equivalent) to read internal attributes. The source geometry and HIP were not changed."
+                    % (packed_count, unpacked_count)
+                )
+            else:
+                lines.append(
+                    "- Packed inspection: detected %s packed folder leaves; temporarily unpacked %s with `hou.Geometry.unpackFromFolder()` (Unpack Folder equivalent) to read internal attributes. The source geometry and HIP were not changed."
+                    % (packed_count, unpacked_count)
+                )
+            lines.append("- Packed inspection note: 属性確認のため一時ジオメトリ上でアンパックしました。元のノードとHIPは変更していません。")
+            if failed_count:
+                lines.append("- Packed inspection warning: %s packed paths could not be unpacked." % failed_count)
             lines.append("")
-            lines.extend(_ultra_geometry_lines(geometry_summary))
+            counts = geometry_summary.get("counts", {}) or {}
+            packed_pieces = packed_count is not None and packed_count == counts.get("primitives")
+            lines.extend(
+                _simple_geometry_attribute_lines(
+                    geometry_summary,
+                    "Attributes on packed container geometry",
+                    packed_pieces=packed_pieces,
+                )
+            )
+            lines.extend(
+                _simple_geometry_attribute_lines(
+                    unpacked_summary,
+                    "Attributes after temporary unpack",
+                    packed_pieces=False,
+                )
+            )
+        else:
+            lines.extend(_simple_geometry_attribute_lines(geometry_summary, "Attributes"))
 
-    if data.get("code_blocks"):
-        lines.extend(_render_code_blocks(data.get("code_blocks", [])))
     if data.get("errors"):
         lines.extend(_render_errors(data.get("errors", [])))
     lines.extend(_llm_footer_lines(data))
@@ -4235,6 +5344,8 @@ def export_current_scene(
     include_bypassed_nodes: bool = DEFAULT_INCLUDE_BYPASSED_NODES,
     include_scene_paths: bool = DEFAULT_INCLUDE_SCENE_PATHS,
     include_network_items: bool = False,
+    include_top_summary: bool = DEFAULT_INCLUDE_TOP_SUMMARY,
+    top_work_item_limit: int = DEFAULT_TOP_WORK_ITEM_LIMIT,
     temporary_frame: Optional[float] = None,
 ) -> Dict[str, str]:
     if markdown_mode in ("smart", "rbd_smart"):
@@ -4242,14 +5353,13 @@ def export_current_scene(
         # Disable When state and live dynamic menus, so state capture is not
         # optional even if the corresponding advanced checkbox is off.
         include_parameter_state = True
+        include_top_summary = True
     if markdown_mode in ("attributes", "ultra"):
-        # Attribute mode ("ultra" is its legacy name) dumps geometry attributes:
-        # it needs cooked geometry and sample values.
+        # Attribute mode ("ultra" is its legacy name) cooks all SOP geometry,
+        # but summarizes per-element values instead of dumping large samples.
         include_geometry_summary = True
         geometry_node_mode = "all"
         include_standard_attributes = True
-        if geometry_sample_count == 0:
-            geometry_sample_count = DEFAULT_ULTRA_SAMPLE_COUNT
     exporter = HoudiniSceneExporter(
         root_paths=root_paths,
         node_paths=node_paths,
@@ -4271,6 +5381,8 @@ def export_current_scene(
         include_bypassed_nodes=include_bypassed_nodes,
         include_scene_paths=include_scene_paths,
         include_network_items=include_network_items,
+        include_top_summary=include_top_summary,
+        top_work_item_limit=top_work_item_limit,
         temporary_frame=temporary_frame,
     )
     data = exporter.export()
@@ -4424,7 +5536,7 @@ class HoudiniSceneExportDialog:
             ("コンパクト", "compact"),
             ("スマートモード（実験的）", "smart"),
             ("詳細", "verbose"),
-            ("アトリビュート（選択ノードの属性値・cookします）", "attributes"),
+            ("アトリビュート（シンプル集計・Packed一時展開）", "attributes"),
         ):
             self.markdown_mode_combo.addItem(label, value)
         _set_combo_value(self.markdown_mode_combo, DEFAULT_MARKDOWN_MODE)
@@ -4504,6 +5616,17 @@ class HoudiniSceneExportDialog:
         self.packed_rig_trees_check.setChecked(DEFAULT_INCLUDE_PACKED_RIG_TREES)
         geo_layout.addRow("", self.packed_rig_trees_check)
         advanced_layout.addWidget(geo_group)
+
+        top_group = QtWidgets.QGroupBox("TOP / PDG")
+        top_layout = QtWidgets.QFormLayout(top_group)
+        self.top_summary_check = QtWidgets.QCheckBox("現在のPDG / Work Item状態を含める（再cookしません・スマートモードでは自動）")
+        self.top_summary_check.setChecked(DEFAULT_INCLUDE_TOP_SUMMARY)
+        top_layout.addRow("", self.top_summary_check)
+        self.top_work_item_limit_spin = QtWidgets.QSpinBox()
+        self.top_work_item_limit_spin.setRange(0, 1000)
+        self.top_work_item_limit_spin.setValue(DEFAULT_TOP_WORK_ITEM_LIMIT)
+        top_layout.addRow("詳細を出すWork Item上限", self.top_work_item_limit_spin)
+        advanced_layout.addWidget(top_group)
         layout.addWidget(advanced_section)
 
         self.status_label = QtWidgets.QLabel("")
@@ -4605,6 +5728,8 @@ class HoudiniSceneExportDialog:
             "include_bypassed_nodes": self.include_bypassed_check.isChecked(),
             "include_network_items": self.include_network_items_check.isChecked(),
             "include_scene_paths": self.include_scene_paths_check.isChecked(),
+            "include_top_summary": self.top_summary_check.isChecked(),
+            "top_work_item_limit": self.top_work_item_limit_spin.value(),
             "temporary_frame": self.temporary_frame_spin.value() if self.temporary_frame_check.isChecked() else None,
         }
 
@@ -4705,7 +5830,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selected", action="store_true", help="Export selected nodes only, without recursing into their children.")
     parser.add_argument("--out", default=None, help="Output file base/path or directory. Default: $HIP/<hip>_scene_text_<timestamp>.")
     parser.add_argument("--format", choices=("markdown", "json", "both"), default="markdown", help="Output format.")
-    parser.add_argument("--markdown-mode", choices=("compact", "smart", "rbd_smart", "verbose", "attributes", "ultra"), default=DEFAULT_MARKDOWN_MODE, help="Markdown detail level. smart renders node settings using current visible Parameter Pane labels and menu choices. rbd_smart is a deprecated alias for smart. attributes dumps geometry attribute/group values for the exported nodes (works with multiple selected nodes; forces geometry cooking). ultra is a deprecated alias for attributes.")
+    parser.add_argument("--markdown-mode", choices=("compact", "smart", "rbd_smart", "verbose", "attributes", "ultra"), default=DEFAULT_MARKDOWN_MODE, help="Markdown detail level. smart renders visible UI settings and includes a read-only snapshot of existing TOP/PDG work items, failures, logs and cook-time scripts without starting a cook. rbd_smart is a deprecated alias for smart. attributes summarizes point/vertex/primitive/detail attributes and temporarily unpacks packed contents for inspection (works with multiple selected nodes; forces geometry cooking). ultra is a deprecated alias for attributes.")
     parser.add_argument("--include-scene-paths", action="store_true", help="Include HIP and loaded HDA file paths. Off by default.")
     parser.add_argument("--changed-only", action="store_true", help="Only include parameters that are not at default values.")
     parser.add_argument("--evaluate-parameters", dest="evaluate_parameters", action="store_true", default=DEFAULT_EVALUATE_PARAMETERS, help="Evaluate parameter values on the current frame. On by default.")
@@ -4717,6 +5842,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-hidden-parms", action="store_true", help="Deprecated compatibility option. Hidden parameters are skipped by default.")
     parser.add_argument("--include-bypassed-nodes", action="store_true", help="Include bypassed nodes. Off by default to keep exports focused on active flow.")
     parser.add_argument("--include-network-items", action="store_true", help="Include sticky notes, network boxes and network dots as records. Off by default; dots are always collapsed into direct connections.")
+    parser.add_argument("--include-top-summary", action="store_true", help="Include the current already-generated TOP/PDG work-item snapshot without starting a cook. Enabled automatically by smart mode.")
+    parser.add_argument("--top-work-item-limit", type=int, default=DEFAULT_TOP_WORK_ITEM_LIMIT, help="Maximum detailed TOP work-item records per node. State totals remain complete. Default 32; use 0 for totals only.")
     parser.add_argument("--recurse-locked", action="store_true", help="Recurse into locked HDAs. Off by default to keep exports compact.")
     parser.add_argument("--sync-delayed", action="store_true", help="Force delayed HDA contents to load. Off by default.")
     parser.add_argument("--no-recurse-locked", action="store_true", help="Deprecated compatibility option. Locked HDA recursion is off by default.")
@@ -4726,7 +5853,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-geometry-summary", action="store_true", help="Cook important SOP geometry and include filtered attribute metadata. Off by default to avoid triggering heavy simulations.")
     parser.add_argument("--skip-geometry-summary", action="store_true", help="Do not cook SOP geometry or export geometry attributes.")
     parser.add_argument("--geometry-node-mode", choices=("important", "all", "none"), default=DEFAULT_GEOMETRY_NODE_MODE, help="Which SOP nodes should export geometry metadata. important exports display/render/selected/current and output/null/cache nodes.")
-    parser.add_argument("--geometry-sample-count", type=int, default=DEFAULT_GEOMETRY_SAMPLE_COUNT, help="Number of point/vertex/primitive attribute sample values to include per attribute. Default 0 is metadata only. Use -1 to export all values.")
+    parser.add_argument("--geometry-sample-count", type=int, default=DEFAULT_GEOMETRY_SAMPLE_COUNT, help="Optional point/vertex/primitive sample values stored in JSON. Default 0 stores metadata only. Simple Attribute Markdown stays summarized.")
     parser.add_argument("--include-standard-attributes", action="store_true", help="Include common point/vertex attributes such as P, N, uv, Cd, v, pscale.")
     parser.add_argument("--include-private-attributes", action="store_true", help="Include private geometry attributes.")
     parser.add_argument("--skip-private-attributes", action="store_true", help="Deprecated compatibility option. Private attributes are skipped by default.")
@@ -4792,6 +5919,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             include_bypassed_nodes=args.include_bypassed_nodes,
             include_scene_paths=args.include_scene_paths,
             include_network_items=args.include_network_items,
+            include_top_summary=args.include_top_summary,
+            top_work_item_limit=args.top_work_item_limit,
             temporary_frame=args.temporary_frame,
         )
     except Exception:
