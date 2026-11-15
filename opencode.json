@@ -1,0 +1,56 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "enabled_providers": [
+    "strata"
+  ],
+  "model": "strata/qwen3.8-flash-next-iq3_s",
+  "small_model": "strata/qwen3.8-flash-next-iq3_s",
+  "provider": {
+    "strata": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Strata (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "none"
+      },
+      "models": {
+        "qwen3.8-flash-next-iq3_s": {
+          "name": "Strata Qwen3.8 Original IQ3_S",
+          "temperature": true,
+          "tool_call": true,
+          "options": {
+            "reasoningEffort": "high"
+          },
+          "limit": {
+            "context": 131072,
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "build": {
+      "temperature": 1.0,
+      "top_p": 0.95
+    },
+    "plan": {
+      "temperature": 1.0,
+      "top_p": 0.95
+    }
+  },
+  "permission": {
+    "*": "deny",
+    "read": "allow",
+    "grep": "allow",
+    "glob": "allow",
+    "question": "allow",
+    "todowrite": "allow",
+    "houdini_memo": "allow",
+    "edit": "deny",
+    "bash": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "external_directory": "ask"
+  }
+}
